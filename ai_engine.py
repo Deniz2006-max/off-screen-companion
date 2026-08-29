@@ -309,6 +309,7 @@ class State(TypedDict, total=False):
     city: str
     activity_preference: str
     preference_ready: bool
+    screen_time_done: bool
 
 
 llm = ChatOpenAI(
@@ -428,24 +429,80 @@ def _user_conversation_text(state: State) -> str:
     )
 
 
-def _extract_city(state: State) -> str:
-    blob = _user_conversation_text(state).lower()
+def _extract_city_from_text(text: str) -> str:
+    blob = (text or "").lower()
     for needle, label in CITY_ALIASES.items():
         if needle in blob:
             return label
-    return (state.get("city") or "").strip()
+    return ""
 
 
-def _extract_activity_preference(state: State) -> str:
-    blob = _user_conversation_text(state).lower()
+def _extract_preference_from_text(text: str) -> str:
+    blob = (text or "").lower()
     indoor = any(cue in blob for cue in INDOOR_CUES)
     outdoor = any(cue in blob for cue in OUTDOOR_CUES)
     if indoor and outdoor:
+        if "outdoor" in blob or "açık hava" in blob or "acik hava" in blob:
+            return "outdoor"
+        if "indoor" in blob:
+            return "indoor"
         return "both"
     if indoor:
         return "indoor"
     if outdoor:
         return "outdoor"
+    return ""
+
+
+def _latest_has_city_or_setting_cue(state: State) -> bool:
+    latest = _latest_user_text(state).lower()
+    if not latest:
+        return False
+    if _extract_city_from_text(latest):
+        return True
+    return any(
+        cue in latest
+        for cue in ("indoor", "outdoor", "iç mekan", "acik hava", "açık hava")
+    )
+
+
+def _screen_time_already_done(state: State) -> bool:
+    if state.get("screen_time_done"):
+        return True
+    markers = (
+        "**total screen time**",
+        "total screen time:",
+        "**detox suggestion**",
+        "detox suggestion:",
+        "which city are you located",
+        PREFERENCE_PROMPT.lower()[:48],
+    )
+    for message in state.get("messages", []):
+        if not _is_ai(message):
+            continue
+        text = _message_text(message).lower()
+        if any(marker in text for marker in markers):
+            return True
+    return False
+
+
+def _extract_city(state: State) -> str:
+    latest = _extract_city_from_text(_latest_user_text(state))
+    if latest:
+        return latest
+    from_history = _extract_city_from_text(_user_conversation_text(state))
+    if from_history:
+        return from_history
+    return (state.get("city") or "").strip()
+
+
+def _extract_activity_preference(state: State) -> str:
+    latest = _extract_preference_from_text(_latest_user_text(state))
+    if latest:
+        return latest
+    from_history = _extract_preference_from_text(_user_conversation_text(state))
+    if from_history:
+        return from_history
     return (state.get("activity_preference") or "").strip()
 
 
@@ -617,15 +674,22 @@ def _preference_fields_ready(state: State) -> bool:
     return bool(_extract_city(state) and _extract_activity_preference(state))
 
 
-def scope_check(
-    state: State,
-) -> Literal["reject_node", "screen_time_node", "activity_preference_node"]:
-    """Validate text and images, then run analysis or jump to the preference gate."""
+def _passthrough(state: State) -> dict[str, Any]:
+    return {}
+
+
+def scope_check(state: State) -> Literal["reject_node", "task_router"]:
+    """Reject out-of-scope turns; otherwise hand off to task_router."""
     if _image_is_irrelevant(state):
         return "reject_node"
 
-    if _preference_fields_ready(state) or _assistant_asked_for_location_or_hobbies(state):
-        return "activity_preference_node"
+    if (
+        _latest_has_city_or_setting_cue(state)
+        or _screen_time_already_done(state)
+        or _preference_fields_ready(state)
+        or _assistant_asked_for_location_or_hobbies(state)
+    ):
+        return "task_router"
 
     label = _classify(
         SCOPE_ROUTER_PROMPT,
@@ -635,6 +699,29 @@ def scope_check(
     )
     if label != "IN_SCOPE":
         return "reject_node"
+    return "task_router"
+
+
+def task_router(
+    state: State,
+) -> Literal["screen_time_node", "activity_preference_node"]:
+    """Send city/preference answers to the preference gate, never back to analysis."""
+    missing_in_state = not (
+        (state.get("city") or "").strip()
+        and (state.get("activity_preference") or "").strip()
+    )
+
+    # City / indoor / outdoor replies skip analysis when state fields are empty.
+    if missing_in_state and _latest_has_city_or_setting_cue(state):
+        return "activity_preference_node"
+
+    # After analysis exists, later turns never re-enter screen_time_node.
+    if _screen_time_already_done(state):
+        return "activity_preference_node"
+
+    if _preference_fields_ready(state) or _assistant_asked_for_location_or_hobbies(state):
+        return "activity_preference_node"
+
     return "screen_time_node"
 
 
@@ -674,13 +761,25 @@ def screen_time_node(state: State) -> dict[str, list[BaseMessage]]:
     analysis = _message_text(response).strip()
     if PREFERENCE_PROMPT.lower() not in analysis.lower():
         analysis = f"{analysis}\n\n{PREFERENCE_PROMPT}"
-    return {"messages": [AIMessage(content=analysis)]}
+    return {
+        "messages": [AIMessage(content=analysis)],
+        "screen_time_done": True,
+    }
 
 
 def activity_preference_node(state: State) -> dict[str, Any]:
-    """Pause until city and indoor/outdoor preference exist; then unlock event search."""
-    city = _extract_city(state)
-    preference = _extract_activity_preference(state)
+    """Read the latest user reply for city/setting, then unlock event search."""
+    latest = _latest_user_text(state)
+    city = (
+        _extract_city_from_text(latest)
+        or (state.get("city") or "").strip()
+        or _extract_city(state)
+    )
+    preference = (
+        _extract_preference_from_text(latest)
+        or (state.get("activity_preference") or "").strip()
+        or _extract_activity_preference(state)
+    )
     if city and preference:
         return {
             "city": city,
@@ -790,6 +889,7 @@ def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
 
 def build_graph():
     workflow = StateGraph(State)
+    workflow.add_node("task_router", _passthrough)
     workflow.add_node("reject_node", reject_node)
     workflow.add_node("screen_time_node", screen_time_node)
     workflow.add_node("activity_preference_node", activity_preference_node)
@@ -800,6 +900,13 @@ def build_graph():
         scope_check,
         {
             "reject_node": "reject_node",
+            "task_router": "task_router",
+        },
+    )
+    workflow.add_conditional_edges(
+        "task_router",
+        task_router,
+        {
             "screen_time_node": "screen_time_node",
             "activity_preference_node": "activity_preference_node",
         },
