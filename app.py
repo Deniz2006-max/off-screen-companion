@@ -149,13 +149,28 @@ def render_onboarding_page() -> None:
             with st.spinner("Analyzing your screen time..."):
                 analysis = analyze_screen_time(image_file, notes)
                 st.session_state.last_analysis = analysis
+
+                # Safely handle both dict and string responses from backend
+                if isinstance(analysis, dict):
+                    insight_text = analysis.get("insight", str(analysis))
+                    suggestions = analysis.get("suggestions", [])
+                else:
+                    insight_text = str(analysis)
+                    suggestions = []
+
+                suggestion_text = ""
+                if suggestions:
+                    suggestion_text = " Try this: " + "; ".join(str(item) for item in suggestions)
+                elif isinstance(analysis, dict) and analysis.get("suggestion"):
+                    suggestion_text = f" Try this: {analysis['suggestion']}"
+
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
                         "content": (
-                            "I looked at your screen time. "
-                            f"{analysis['insight']} "
-                            f"Try this: {analysis['suggestion']}"
+                            "I looked at your screen time.\n\n"
+                            f"{insight_text}"
+                            f"{suggestion_text}"
                         ),
                     }
                 )

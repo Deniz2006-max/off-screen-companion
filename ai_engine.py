@@ -38,14 +38,37 @@ REJECT_REPLY = (
     "balance, and finding local activities to replace screen time. How can I "
     "help you today?"
 )
+ACTIVE_CHAT_REJECT = (
+    "Sohbetimizin odağını bozmayalım, ekran süresi ve dijital detoks planımıza "
+    "devam edelim. Ekran süreniz veya aktivite önerileriyle ilgili başka nasıl "
+    "yardımcı olabilirim?"
+)
 
 ANALYZE_SCREEN_TIME_SYSTEM_PROMPT = """
-Role: You are an empathetic, non-judgmental Digital Well-Being Assistant.
+Role: You are an empathetic, non-judgmental Digital Well-Being Assistant with vision.
 
-Technique & Instructions (Step-by-Step):
-Step 1: Extract total usage time and top used apps from the input screenshot or text.
-Step 2: Calculate constructive real-world equivalents without inducing guilt (e.g., 'In 4.5 hours, you could watch 2 feature films, read 90 book pages, or attend a local theater play.').
-Step 3: Offer a practical digital-detox or time-management suggestion. Do not ask for city or indoor/outdoor preference; a later step collects that.
+If a screen-time screenshot (image) is provided, you MUST perform Image-to-Text extraction first. Do not skip or invent numbers that are not visible.
+
+Structured extraction (required):
+1. Total active screen hours as shown on the screenshot (or notes).
+2. The top 3-4 apps with their specific durations (e.g., Instagram: 2h 30m, TikTok: 1h 45m).
+3. Constructive real-world time equivalents based on those exact totals, without inducing guilt
+   (e.g., 'In 4.5 hours, you could watch 2 feature films, read 90 book pages, or attend a local theater play.').
+4. A practical digital-detox suggestion tailored to the specific apps you extracted.
+
+Reply in clear markdown the UI can display:
+**Total screen time:** ...
+**Top apps:**
+- App: duration
+**Real-world equivalent:** ...
+**Detox suggestion:** ...
+
+If only text notes are provided, extract the same structure from the notes.
+
+After the structured breakdown, ALWAYS end with a proactive transition question asking for their city and whether they prefer indoor activities (movies, theater, book cafes) or outdoor activities (nature walks, concerts). Use this exact question:
+To give you the best screen-free recommendations, would you prefer indoor activities (like movies, theater, or reading spots) or outdoor activities (like nature walks or concerts)? Also, which city are you located in?
+
+Do not recommend specific local events, movies, or venues in this step.
 
 Ethical Constraints & Guardrails:
 - DO NOT judge, shame, or use harsh language regarding screen time.
@@ -54,24 +77,20 @@ Ethical Constraints & Guardrails:
 """
 
 EVENT_RECOMMENDATIONS_SYSTEM_PROMPT = """
-Role: You are a local culture and activity recommender helping people replace screen time with real-world plans.
+Role: You are a hybrid local-activity guide for digital well-being: live Tavily facts plus creative, personalized reasoning.
 
-Universal anti-hallucination (all categories):
-You must ONLY recommend real events, real book titles/authors, active movies, active theater plays, and genuine physical venues that are explicitly mentioned in the Tavily search context or are widely recognized real-world classics/blockbusters.
+Hybrid method:
+1. Ground names, venues, dates, movies, and events in the Tavily search context or widely recognized real-world classics/blockbusters.
+2. Use creative LLM reasoning to personalize why each idea is a good screen-free swap (fit the user's city, indoor/outdoor preference, and prior screen-time context).
+3. Support multi-turn follow-ups: if the user asks more about a recommendation (hours, which option if they are tired, how to get there, another similar idea), stay on that thread and answer helpfully. Run with new search facts when they ask for updated listings.
 
-If search results are ambiguous or lack a specific live schedule for cinema, concerts, theater, books, or hiking:
+If search results are ambiguous or lack a specific live schedule:
 - Do NEVER invent fake film names, fictional event dates, non-existent plays, or made-up venue locations.
-- Instead recommend well-known, verified local venues/spots (e.g. Atlas 1948, Kadıköy Sineması, Zorlu PSM, DasDas, Belgrat Ormanı, Atatürk Kent Ormanı, iconic book cafes) and suggest checking their current schedules.
+- Recommend well-known, verified local venues (e.g. Atlas 1948, Kadıköy Sineması, Zorlu PSM, DasDas, Belgrat Ormanı, Atatürk Kent Ormanı, iconic book cafes) and suggest checking their current schedules.
 
-Strict category isolation:
-Answer ONLY the specific activity type requested in the user's latest message.
-- Books / reading → only books and reading spots.
-- Movies → only movies and cinemas.
-- Concerts → only concerts.
-- Theater → only plays and stages.
-- Hiking / outdoor → only nature walks, parks, forests.
+Category focus: prefer the activity type in the user's latest message (books, movies, concerts, theater, or outdoor), while still answering follow-up questions about ideas you already suggested.
 
-Keep the tone encouraging and non-judgmental. Do not ask for city or preference again if they are already known.
+Keep the tone encouraging and non-judgmental. Invite another follow-up at the end (e.g. a different neighborhood or indoor vs outdoor).
 """
 
 PREFERENCE_PROMPT = (
@@ -89,14 +108,22 @@ Replacing screen time with ANY offline or non-screen activity — including home
 
 IN_SCOPE if any of these are true:
 - The thread is about screen time, phone/app usage, digital detox, time management, or real-world / at-home activities that replace screens.
+- The user sent a screen-time / Digital Wellbeing / app-usage UI screenshot or notes about usage hours.
 - The user wants to stay home and read, cook, journal, craft, listen to music, or otherwise unplug.
 - The assistant just asked a follow-up (city, hobbies, indoor/outdoor, location) and the user is answering it.
-- The latest user message would look unrelated in isolation but continues this well-being thread
-  (e.g. "I want to stay home and read historical novels" or "I live in İstanbul and I like going to cinema").
 
-OUT_SCOPE only if the user clearly starts a new topic that is NOT an offline alternative to screens
-(e.g. write my homework code, sports match trivia with no unplug intent, unrelated academic history quiz)
-AND they are not answering an assistant follow-up in this conversation.
+OUT_SCOPE if:
+- An attached image is not a screen-time report or device-usage UI screenshot (e.g. food, selfies, random photos).
+- The user clearly starts a new topic that is NOT an offline alternative to screens
+  (e.g. write my homework code) AND they are not answering an assistant follow-up.
+"""
+
+IMAGE_SCOPE_PROMPT = """
+Classify the attached image for a digital well-being app.
+Reply with exactly one token: SCREEN_TIME_IMAGE or IRRELEVANT_IMAGE.
+
+SCREEN_TIME_IMAGE = phone or computer Screen Time / Digital Wellbeing / app usage / battery usage dashboards and similar UI screenshots. Label these IN_SCOPE.
+IRRELEVANT_IMAGE = anything else (food, people, landscapes, memes, unrelated documents). Label these OUT_SCOPE.
 """
 
 TASK_ROUTER_PROMPT = """
@@ -555,15 +582,50 @@ def _run_category_searches(state: State) -> tuple[str, bool, list[str]]:
     return "\n\n".join(chunks), any_hits, categories
 
 
-def scope_check(state: State) -> Literal["reject_node", "task_router"]:
-    """Step 1: route using full conversation context, including follow-up answers."""
-    if (
-        _assistant_asked_for_location_or_hobbies(state)
-        or _looks_like_activity_followup(state)
-        or _is_offline_hobby_request(state)
-        or _wants_home_reading(state)
-    ):
-        return "task_router"
+def _latest_human_message(state: State) -> Any | None:
+    for message in reversed(state.get("messages", [])):
+        if _is_human(message):
+            return message
+    return None
+
+
+def _message_has_image(message: Any) -> bool:
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        return any(
+            isinstance(part, dict) and part.get("type") == "image_url"
+            for part in content
+        )
+    return False
+
+
+def _image_is_irrelevant(state: State) -> bool:
+    message = _latest_human_message(state)
+    if message is None or not _message_has_image(message):
+        return False
+    response = router_llm.invoke(
+        [
+            SystemMessage(content=IMAGE_SCOPE_PROMPT),
+            message,
+        ]
+    )
+    token = _message_text(response).strip().split()[0].upper().replace("-", "_")
+    return token == "IRRELEVANT_IMAGE"
+
+
+def _preference_fields_ready(state: State) -> bool:
+    return bool(_extract_city(state) and _extract_activity_preference(state))
+
+
+def scope_check(
+    state: State,
+) -> Literal["reject_node", "screen_time_node", "activity_preference_node"]:
+    """Validate text and images, then run analysis or jump to the preference gate."""
+    if _image_is_irrelevant(state):
+        return "reject_node"
+
+    if _preference_fields_ready(state) or _assistant_asked_for_location_or_hobbies(state):
+        return "activity_preference_node"
 
     label = _classify(
         SCOPE_ROUTER_PROMPT,
@@ -571,40 +633,52 @@ def scope_check(state: State) -> Literal["reject_node", "task_router"]:
         {"IN_SCOPE", "OUT_SCOPE"},
         "IN_SCOPE",
     )
-    return "task_router" if label == "IN_SCOPE" else "reject_node"
+    if label != "IN_SCOPE":
+        return "reject_node"
+    return "screen_time_node"
 
 
-def task_router(state: State) -> Literal["screen_time_node", "activity_preference_node"]:
-    """Step 2: screen-time analysis, or collect city/preference before events."""
-    if _looks_like_activity_followup(state):
-        return "activity_preference_node"
-
-    label = _classify(
-        TASK_ROUTER_PROMPT,
-        state,
-        {"SCREEN_TIME", "ACTIVITY"},
-        "SCREEN_TIME",
-    )
-    return "activity_preference_node" if label == "ACTIVITY" else "screen_time_node"
+def _is_active_wellbeing_chat(state: State) -> bool:
+    for message in state.get("messages", []):
+        if not _is_ai(message):
+            continue
+        text = _message_text(message).strip()
+        if text and text not in {REJECT_REPLY, ACTIVE_CHAT_REJECT}:
+            return True
+    return False
 
 
 def reject_node(state: State) -> dict[str, list[AIMessage]]:
-    return {"messages": [AIMessage(content=REJECT_REPLY)]}
-
-
-def _passthrough(state: State) -> dict:
-    return {}
+    reply = ACTIVE_CHAT_REJECT if _is_active_wellbeing_chat(state) else REJECT_REPLY
+    return {"messages": [AIMessage(content=reply)]}
 
 
 def screen_time_node(state: State) -> dict[str, list[BaseMessage]]:
-    response = llm.invoke(
-        [SystemMessage(content=ANALYZE_SCREEN_TIME_SYSTEM_PROMPT), *state["messages"]]
-    )
-    return {"messages": [response]}
+    """Extract screen-time stats, then ask for city and indoor/outdoor preference."""
+    prompt_messages: list[BaseMessage] = [
+        SystemMessage(content=ANALYZE_SCREEN_TIME_SYSTEM_PROMPT)
+    ]
+    if any(_message_has_image(message) for message in state.get("messages", [])):
+        prompt_messages.append(
+            SystemMessage(
+                content=(
+                    "A screen-time screenshot is attached. Read the image carefully and "
+                    "extract total active hours plus the top 3-4 apps with their exact "
+                    "durations before writing equivalents or a detox suggestion. "
+                    "End by asking for city and indoor/outdoor preference."
+                )
+            )
+        )
+    prompt_messages.extend(state["messages"])
+    response = llm.invoke(prompt_messages)
+    analysis = _message_text(response).strip()
+    if PREFERENCE_PROMPT.lower() not in analysis.lower():
+        analysis = f"{analysis}\n\n{PREFERENCE_PROMPT}"
+    return {"messages": [AIMessage(content=analysis)]}
 
 
 def activity_preference_node(state: State) -> dict[str, Any]:
-    """Stop until the user has given both city and indoor/outdoor preference."""
+    """Pause until city and indoor/outdoor preference exist; then unlock event search."""
     city = _extract_city(state)
     preference = _extract_activity_preference(state)
     if city and preference:
@@ -612,6 +686,22 @@ def activity_preference_node(state: State) -> dict[str, Any]:
             "city": city,
             "activity_preference": preference,
             "preference_ready": True,
+        }
+
+    last = state.get("messages", [])[-1] if state.get("messages") else None
+    already_asked = bool(
+        last is not None
+        and _is_ai(last)
+        and (
+            "which city" in _message_text(last).lower()
+            or "hangi şehir" in _message_text(last).lower()
+        )
+    )
+    if already_asked:
+        return {
+            "city": city,
+            "activity_preference": preference,
+            "preference_ready": False,
         }
 
     return {
@@ -672,11 +762,12 @@ def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
                 f"City: {city}. Indoor/outdoor preference: {preference}. "
                 f"This-turn focus: {focus}. Categories searched: {', '.join(categories)}. "
                 f"{isolation} "
-                "ONLY recommend real events, real book titles/authors, active movies, "
-                "active theater plays, and genuine venues named in the Tavily search "
-                "context or widely recognized classics/blockbusters. "
-                "If results are ambiguous, recommend verified venues and their current "
-                "schedules instead of inventing details."
+                "HYBRID: use Tavily for real venues/dates/movies/events, then add "
+                "personalized, creative reasons these are good screen-free plans. "
+                "If this is a follow-up, answer the user's question about the prior "
+                "recommendations; search again when they need fresh listings. "
+                "Never invent titles or dates that are not in search or widely known. "
+                "Invite another follow-up at the end."
             )
         ),
     ]
@@ -700,7 +791,6 @@ def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
 def build_graph():
     workflow = StateGraph(State)
     workflow.add_node("reject_node", reject_node)
-    workflow.add_node("task_router", _passthrough)
     workflow.add_node("screen_time_node", screen_time_node)
     workflow.add_node("activity_preference_node", activity_preference_node)
     workflow.add_node("event_finder_node", event_finder_node)
@@ -710,13 +800,6 @@ def build_graph():
         scope_check,
         {
             "reject_node": "reject_node",
-            "task_router": "task_router",
-        },
-    )
-    workflow.add_conditional_edges(
-        "task_router",
-        task_router,
-        {
             "screen_time_node": "screen_time_node",
             "activity_preference_node": "activity_preference_node",
         },
@@ -781,14 +864,23 @@ def invoke_graph(user_message: HumanMessage, history: list | None = None) -> str
 
 
 def analyze_screen_time(image_file: Any | None = None, text_input: str | None = None) -> str:
-    """Analyze a screen-time screenshot and/or notes through the LangGraph workflow."""
+    """Extract a textual screen-time breakdown from a screenshot and/or notes.
+
+    Returns markdown the Streamlit UI can store in session state and display.
+    Calls the vision screen-time node directly so the preference gate does not
+    replace the extracted breakdown.
+    """
     notes = (text_input or "").strip()
     data_url = _image_to_data_url(image_file)
     if data_url:
         content: list[dict[str, Any]] = [
             {
                 "type": "text",
-                "text": notes or "Please analyze this screen-time screenshot.",
+                "text": notes
+                or (
+                    "Extract total active screen hours and the top 3-4 apps with "
+                    "specific durations from this screenshot."
+                ),
             },
             {"type": "image_url", "image_url": {"url": data_url}},
         ]
@@ -801,7 +893,9 @@ def analyze_screen_time(image_file: Any | None = None, text_input: str | None = 
                 "or time-management approach."
             )
         )
-    return invoke_graph(user_message)
+
+    result = screen_time_node({"messages": [user_message]})
+    return _message_text(result["messages"][-1])
 
 
 def get_event_recommendations(city: str, hobbies: str) -> str:
