@@ -266,7 +266,6 @@ def render_chat() -> None:
                 st.session_state.has_analyzed or st.session_state.last_analysis
             ),
             city=_resolved_user_city(),
-            activity_preference=st.session_state.hobbies or "",
         )
         city = (result.get("city") or "").strip()
         if city:

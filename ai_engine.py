@@ -89,16 +89,17 @@ Role: You are a live-events guide for digital well-being. Always reply in Englis
 You recommend real-time public events: movies, concerts, theater, sports matches, festivals, and exhibitions.
 
 Method:
-1. Use the Tavily search payload first. Ground event names, dates, times, and venues in that payload.
+1. Use the Tavily search payload first. Ground event names, dates, times, venues, and ticket details in that payload.
 2. For each recommendation, use this markdown structure:
    - **Event Name:** ...
    - **Date & Time:** ... (only if present in Tavily)
-   - **Venue:** ... (e.g. Harbiye Open Air, Zorlu PSM, Parkorman)
-   - **Detox Note:** one sentence on why this live outing is a strong screen-free swap
+   - **Venue:** ...
+   - **Tickets:** ... (only if present in Tavily)
 3. Do NOT repeat the earlier screen-time analysis.
-4. Do NEVER invent fake event names, dates, or venues. If a field is missing in Tavily, omit it.
+4. Do NEVER invent fake event names, dates, venues, or showtimes. If a field is missing in Tavily, omit it.
+5. NEVER answer book, recipe, craft, or home-workout requests — those belong elsewhere.
 
-Keep the tone encouraging. Invite another follow-up at the end.
+Keep the tone encouraging. Do not add a detox note; a later step handles that.
 """
 
 LIFESTYLE_RECOMMENDATION_SYSTEM_PROMPT = """
@@ -108,12 +109,15 @@ You recommend personal, mostly at-home or quiet offline resets: books, cooking/r
 
 Method:
 1. Rely primarily on your knowledge for rich, specific content (book titles with authors and short synopses, simple recipes, craft project ideas, short home workouts).
-2. Write in a natural, engaging voice. Do NOT use rigid Event Name / Date / Venue cards.
-3. If quiet reading spots or parks are relevant and local search notes are provided, you may mention real places from those notes.
-4. Do NOT repeat the earlier screen-time analysis.
-5. Do not invent live concert/movie showtimes; send the user to live-event help if they want tickets and dates.
+2. NEVER decline or redirect book, reading, recipe, craft, or home-hobby requests — always deliver helpful recommendations.
+3. For books include: **Book Title**, **Author**, a concise **Synopsis**, and quiet **Reading Spots** in the user's city when known.
+4. For recipes and DIY hobbies include clear step-by-step instructions and the focus/well-being benefits.
+5. Write in a natural, engaging voice. Do NOT use rigid Event Name / Date / Venue cards.
+6. If quiet reading spots or parks are relevant and local search notes are provided, mention real places from those notes.
+7. Do NOT repeat the earlier screen-time analysis.
+8. Do not invent live concert or cinema showtimes.
 
-Keep the tone encouraging and non-judgmental. Invite another follow-up at the end.
+Keep the tone encouraging and non-judgmental. Do not add a detox note; a later step handles that.
 """
 
 PREFERENCE_PROMPT = (
@@ -354,10 +358,13 @@ CITY_ALIASES = {
 class State(TypedDict, total=False):
     messages: Annotated[list, add_messages]
     city: str
+    has_analyzed: bool
+    screen_time_done: bool
+    # Ephemeral per-turn fields (cleared by response_merger_node):
+    active_intent: str
+    draft_response: str
     activity_preference: str
     preference_ready: bool
-    screen_time_done: bool
-    has_analyzed: bool
 
 
 llm = ChatGoogleGenerativeAI(
@@ -723,10 +730,6 @@ def _extract_city(state: State) -> str:
     return _extract_city_from_text(_user_conversation_text(state))
 
 
-def _city_missing_reply() -> dict[str, Any]:
-    return {"messages": [AIMessage(content=CITY_ASK_PROMPT)]}
-
-
 def _extract_activity_preference(state: State) -> str:
     latest = _extract_preference_from_text(_latest_user_text(state))
     if latest:
@@ -761,7 +764,7 @@ def _latest_focus_category(state: State) -> str:
         return "theater"
     if any(cue in latest for cue in ("hike", "hiking", "park", "walk", "doğa", "orman", "forest", "yürüyüş")):
         return "outdoor"
-    preference = _extract_activity_preference(state)
+    preference = _extract_preference_from_text(latest, allow_freeform=True)
     return preference or "offline activities"
 
 
@@ -874,18 +877,12 @@ LIFESTYLE_CUES = (
 )
 
 
-def _event_search_blob(state: State) -> str:
-    return " ".join(
-        (
-            _latest_user_text(state),
-            _extract_activity_preference(state),
-            (state.get("activity_preference") or ""),
-        )
-    ).lower()
+def _latest_message_blob(state: State) -> str:
+    return _latest_user_text(state).lower()
 
 
-def _detect_live_event_categories(state: State) -> list[str]:
-    blob = _event_search_blob(state)
+def _detect_live_categories_from_latest(state: State) -> list[str]:
+    blob = _latest_message_blob(state)
     matched = [
         category
         for category, cues in LIVE_EVENT_CATEGORY_CUES.items()
@@ -910,29 +907,93 @@ def _detect_live_event_categories(state: State) -> list[str]:
     return []
 
 
-def _wants_live_events(state: State) -> bool:
-    return bool(_detect_live_event_categories(state))
+def _latest_wants_live_events(state: State) -> bool:
+    return bool(_detect_live_categories_from_latest(state))
 
 
-def _wants_lifestyle(state: State) -> bool:
-    blob = _event_search_blob(state)
-    if _wants_live_events(state):
+def _latest_wants_lifestyle(state: State) -> bool:
+    blob = _latest_message_blob(state)
+    if _latest_wants_live_events(state):
         return False
-    return any(cue in blob for cue in LIFESTYLE_CUES) or bool(
-        _extract_preference_from_text(_latest_user_text(state), allow_freeform=True)
+    return any(cue in blob for cue in LIFESTYLE_CUES)
+
+
+def _is_city_only_turn(state: State) -> bool:
+    latest = _latest_user_text(state).strip()
+    if not latest:
+        return False
+    city = _extract_city_from_text(latest) or _city_from_short_reply(latest, state)
+    if not city:
+        return False
+    if _extract_preference_from_text(latest, allow_freeform=True):
+        return False
+    if _latest_wants_live_events(state) or _latest_wants_lifestyle(state):
+        return False
+    return True
+
+
+def _build_detox_note(intent: str, latest: str) -> str:
+    lower = latest.lower()
+    if intent == "live":
+        if any(cue in lower for cue in ("cinema", "movie", "film", "sinema")):
+            return (
+                "A cinema outing replaces doom-scrolling with a fixed, shared story "
+                "and a natural phone break in a dark theater."
+            )
+        if any(cue in lower for cue in ("concert", "konser", "festival")):
+            return (
+                "Live music pulls you into the present moment — no feeds, no "
+                "notifications, just the performance in front of you."
+            )
+        if any(cue in lower for cue in ("theater", "theatre", "tiyatro", "play")):
+            return (
+                "Theater demands sustained attention and gives your eyes a rest "
+                "from backlit screens."
+            )
+        if any(cue in lower for cue in ("match", "football", "soccer", "basketball")):
+            return (
+                "Cheering at a live match channels screen-time energy into real-world "
+                "excitement and social connection."
+            )
+        return (
+            "Ticketed live events create a clear offline window — you show up, "
+            "experience something real, and leave your phone in your pocket."
+        )
+    if any(cue in lower for cue in HOME_READING_CUES + ("book", "novel", "reading")):
+        return (
+            "Reading builds deep focus without notifications and gives your mind a "
+            "calmer rhythm than rapid scrolling."
+        )
+    if any(cue in lower for cue in ("recipe", "cook", "cooking", "yemek")):
+        return (
+            "Cooking engages your hands and senses — a tactile reset from passive "
+            "screen consumption."
+        )
+    if any(cue in lower for cue in ("workout", "yoga", "exercise")):
+        return (
+            "Movement clears mental fog from long sessions online and boosts energy "
+            "without another app."
+        )
+    if any(cue in lower for cue in ("park", "walk", "quiet")):
+        return (
+            "Time outdoors lowers the urge to check your phone and restores attention "
+            "through natural surroundings."
+        )
+    return (
+        "Any intentional offline activity breaks the autopilot loop of checking your "
+        "phone and gives your brain space to recharge."
     )
 
 
-def _activity_route(state: State) -> Literal["live_events_node", "lifestyle_recommendation_node"]:
-    if _wants_live_events(state):
-        return "live_events_node"
-    return "lifestyle_recommendation_node"
-
-
-def _wants_live_cinema(state: State) -> bool:
-    return "cinema" in _detect_live_event_categories(state) or _latest_focus_category(
-        state
-    ) == "cinema"
+def _should_skip_detox_note(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        text.strip() == CITY_ASK_PROMPT
+        or PREFERENCE_PROMPT.lower() in lowered
+        or REJECT_REPLY.lower() in lowered
+        or ACTIVE_CHAT_REJECT.lower() in lowered
+        or "**digital detox note:**" in lowered
+    )
 
 
 def _live_cinema_query(city: str) -> str:
@@ -1020,7 +1081,7 @@ def _build_live_search_queries(state: State) -> list[str]:
     if not city:
         return []
     queries: list[str] = []
-    categories = _detect_live_event_categories(state) or ["concerts"]
+    categories = _detect_live_categories_from_latest(state) or ["concerts"]
     for category in categories:
         queries.extend(_live_queries_for_category(city, category))
     seen: set[str] = set()
@@ -1065,13 +1126,9 @@ def _run_tavily_query(search_query: str) -> str:
 
 
 def _run_preference_searches(state: State) -> tuple[str, bool, list[str]]:
-    preference = (
-        _extract_activity_preference(state)
-        or _latest_user_text(state)
-        or "screen-free activities"
-    )
+    preference = _latest_user_text(state) or "live events"
     queries = _build_live_search_queries(state)
-    live_categories = _detect_live_event_categories(state)
+    live_categories = _detect_live_categories_from_latest(state)
     chunks: list[str] = []
     any_hits = False
     for index, search_query in enumerate(queries):
@@ -1089,7 +1146,7 @@ def _run_lifestyle_spot_searches(state: State) -> tuple[str, bool, list[str]]:
     city = _extract_city(state)
     if not city:
         return "", False, []
-    blob = _event_search_blob(state)
+    blob = _latest_message_blob(state)
     queries: list[str] = []
     if any(cue in blob for cue in HOME_READING_CUES + ("cafe", "kafe", "coffee")):
         queries.append(f"{city} quiet book cafes reading spots")
@@ -1144,73 +1201,6 @@ def _image_is_irrelevant(state: State) -> bool:
     return token == "IRRELEVANT_IMAGE"
 
 
-def _preference_fields_ready(state: State) -> bool:
-    return bool(_extract_city(state) and _extract_activity_preference(state))
-
-
-def _passthrough(state: State) -> dict[str, Any]:
-    return {}
-
-
-def scope_check(state: State) -> Literal["reject_node", "task_router"]:
-    """Reject out-of-scope turns; otherwise hand off to task_router."""
-    if _image_is_irrelevant(state):
-        return "reject_node"
-
-    if (
-        _latest_has_city_or_setting_cue(state)
-        or _has_analyzed(state)
-        or _preference_fields_ready(state)
-        or _assistant_asked_for_location_or_hobbies(state)
-    ):
-        return "task_router"
-
-    label = _classify(
-        SCOPE_ROUTER_PROMPT,
-        state,
-        {"IN_SCOPE", "OUT_SCOPE"},
-        "IN_SCOPE",
-    )
-    if label != "IN_SCOPE":
-        return "reject_node"
-    return "task_router"
-
-
-def task_router(
-    state: State,
-) -> Literal[
-    "screen_time_node",
-    "activity_preference_node",
-    "live_events_node",
-    "lifestyle_recommendation_node",
-]:
-    """After analysis, send live shows to Tavily events and hobbies to lifestyle."""
-    if _has_analyzed(state):
-        latest = _latest_user_text(state).strip()
-        wants_activity = bool(
-            latest
-            and (
-                _preference_fields_ready(state)
-                or _extract_preference_from_text(latest, allow_freeform=True)
-                or _extract_activity_preference(state)
-                or _latest_has_city_or_setting_cue(state)
-            )
-        )
-        if wants_activity:
-            return _activity_route(state)
-        return "activity_preference_node"
-
-    missing_in_state = not (
-        (state.get("city") or "").strip()
-        and (state.get("activity_preference") or "").strip()
-    )
-    if missing_in_state and _latest_has_city_or_setting_cue(state):
-        return "activity_preference_node"
-    if _preference_fields_ready(state) or _assistant_asked_for_location_or_hobbies(state):
-        return "activity_preference_node"
-    return "screen_time_node"
-
-
 def _is_active_wellbeing_chat(state: State) -> bool:
     for message in state.get("messages", []):
         if not _is_ai(message):
@@ -1219,11 +1209,6 @@ def _is_active_wellbeing_chat(state: State) -> bool:
         if text and text not in {REJECT_REPLY, ACTIVE_CHAT_REJECT}:
             return True
     return False
-
-
-def reject_node(state: State) -> dict[str, list[AIMessage]]:
-    reply = ACTIVE_CHAT_REJECT if _is_active_wellbeing_chat(state) else REJECT_REPLY
-    return {"messages": [AIMessage(content=reply)]}
 
 
 def screen_time_node(state: State) -> dict[str, list[BaseMessage]]:
@@ -1263,56 +1248,6 @@ def screen_time_node(state: State) -> dict[str, list[BaseMessage]]:
     }
 
 
-def activity_preference_node(state: State) -> dict[str, Any]:
-    """Read the latest user reply for city/setting, then unlock event search."""
-    latest = _latest_user_text(state)
-    city = _extract_city(state)
-    preference = (
-        _extract_preference_from_text(latest, allow_freeform=True)
-        or (state.get("activity_preference") or "").strip()
-        or _extract_activity_preference(state)
-    )
-    payload: dict[str, Any] = {
-        "activity_preference": preference,
-        "preference_ready": bool(preference),
-    }
-    if city:
-        payload["city"] = city
-    if preference:
-        return payload
-
-    last = state.get("messages", [])[-1] if state.get("messages") else None
-    last_text = _message_text(last).lower() if last is not None else ""
-    already_asked = bool(
-        last is not None
-        and _is_ai(last)
-        and (
-            "which city are you located" in last_text
-            or "which city are you currently in" in last_text
-            or "best local options for you" in last_text
-            or "to make the most of your offline time" in last_text
-            or "hangi şehirdesiniz" in last_text
-            or "ekran süreniz dışındaki" in last_text
-            or "which city" in last_text
-            or "hangi şehir" in last_text
-            or PREFERENCE_PROMPT.lower()[:40] in last_text
-        )
-    )
-    if already_asked:
-        return payload
-
-    payload["messages"] = [AIMessage(content=PREFERENCE_PROMPT)]
-    return payload
-
-
-def route_after_preference(
-    state: State,
-) -> Literal["live_events_node", "lifestyle_recommendation_node", "__end__"]:
-    if not state.get("preference_ready"):
-        return END
-    return _activity_route(state)
-
-
 def _looks_like_analysis_message(message: Any) -> bool:
     text = _message_text(message).lower()
     return (
@@ -1339,25 +1274,75 @@ def _chat_for_activity_nodes(state: State) -> list[Any]:
     return trimmed[-8:]
 
 
+def intent_router_node(state: State) -> dict[str, Any]:
+    """Reset per-turn locks and classify the latest user message only."""
+    city = _extract_city(state)
+    latest = _latest_user_text(state).strip()
+
+    payload: dict[str, Any] = {
+        "activity_preference": "",
+        "preference_ready": False,
+        "draft_response": "",
+    }
+    if city:
+        payload["city"] = city
+
+    if _image_is_irrelevant(state):
+        payload["draft_response"] = (
+            ACTIVE_CHAT_REJECT if _is_active_wellbeing_chat(state) else REJECT_REPLY
+        )
+        payload["active_intent"] = "lifestyle"
+        return payload
+
+    if not latest:
+        payload["draft_response"] = PREFERENCE_PROMPT
+        payload["active_intent"] = "lifestyle"
+        return payload
+
+    if _is_city_only_turn(state):
+        saved_city = _extract_city(state)
+        if saved_city:
+            payload["city"] = saved_city
+            payload["draft_response"] = (
+                f"Got it — I'll look for options in {saved_city}. "
+                "What would you like to do there (movies, books, parks, recipes, etc.)?"
+            )
+        payload["active_intent"] = "lifestyle"
+        return payload
+
+    if _latest_wants_live_events(state):
+        payload["active_intent"] = "live"
+    else:
+        payload["active_intent"] = "lifestyle"
+    return payload
+
+
+def route_by_intent(
+    state: State,
+) -> Literal["live_events_node", "lifestyle_recommendation_node"]:
+    if state.get("active_intent") == "live":
+        return "live_events_node"
+    return "lifestyle_recommendation_node"
+
+
 def live_events_node(state: State) -> dict[str, Any]:
     """Live Tavily listings for movies, concerts, theater, matches, festivals, exhibitions."""
+    if (state.get("draft_response") or "").strip():
+        return {}
+
     city = _extract_city(state)
     if not city:
-        return _city_missing_reply()
-    preference = (
-        _extract_activity_preference(state)
-        or _extract_preference_from_text(_latest_user_text(state), allow_freeform=True)
-        or _latest_user_text(state)
-        or "live events"
-    )
+        return {"draft_response": CITY_ASK_PROMPT}
+
+    preference = _latest_user_text(state) or "live events"
     live_results, has_live_data, queries = _run_preference_searches(state)
-    live_categories = _detect_live_event_categories(state) or ["concerts"]
+    live_categories = _detect_live_categories_from_latest(state) or ["concerts"]
     structured_output = (
         "For each live event, use this exact markdown structure drawn ONLY from Tavily:\n"
         "**Event Name:** ...\n"
         "**Date & Time:** ...\n"
         "**Venue:** ...\n"
-        "**Detox Note:** ...\n"
+        "**Tickets:** ...\n"
         "Skip any field that is not explicitly present in the Tavily payload."
     )
     fallback = (
@@ -1375,7 +1360,7 @@ def live_events_node(state: State) -> dict[str, Any]:
                 f"Live event categories: {', '.join(live_categories)}. "
                 f"Tavily queries: {'; '.join(queries)}. "
                 f"{structured_output} "
-                "Recommend only events, movies, artists, dates, and venues that "
+                "Recommend only events, movies, artists, dates, venues, and tickets that "
                 "appear in the Tavily payload. Never invent listings. "
                 "Do NOT use Event cards for books, recipes, or home hobbies."
             )
@@ -1395,31 +1380,40 @@ def live_events_node(state: State) -> dict[str, Any]:
         prompt_messages.append(SystemMessage(content=fallback))
     prompt_messages.extend(_chat_for_activity_nodes(state))
     response = llm.invoke(_messages_for_gemini(prompt_messages))
-    return {"messages": [response], "city": city}
+    payload: dict[str, Any] = {"draft_response": _message_text(response).strip()}
+    if city:
+        payload["city"] = city
+    return payload
 
 
 def lifestyle_recommendation_node(state: State) -> dict[str, Any]:
     """LLM-first books, recipes, crafts, workouts, and quiet parks."""
+    if (state.get("draft_response") or "").strip():
+        return {}
+
     city = _extract_city(state)
-    if not city:
-        return _city_missing_reply()
-    preference = (
-        _extract_activity_preference(state)
-        or _extract_preference_from_text(_latest_user_text(state), allow_freeform=True)
-        or _latest_user_text(state)
-        or "a calm offline reset"
+    needs_local_spots = any(
+        cue in _latest_message_blob(state)
+        for cue in HOME_READING_CUES + ("cafe", "kafe", "coffee", "park", "walk", "quiet")
     )
+    if needs_local_spots and not city:
+        return {"draft_response": CITY_ASK_PROMPT}
+
+    preference = _latest_user_text(state) or "a calm offline reset"
     spot_results, has_spots, queries = _run_lifestyle_spot_searches(state)
     classics = "; ".join(CLASSIC_HISTORICAL_NOVELS)
+    city_line = f"The user is in {city}." if city else "City is unknown — skip local venues."
 
     prompt_messages: list[BaseMessage] = [
         SystemMessage(content=LIFESTYLE_RECOMMENDATION_SYSTEM_PROMPT),
         SystemMessage(
             content=(
-                f"Always reply in English. The user is in {city} and wants: {preference}. "
+                f"Always reply in English. {city_line} "
+                f"The user wants: {preference}. "
                 "Write natural, engaging advice — not Event/Date/Venue cards. "
-                "Offer specific books (title, author, short synopsis), recipes, "
-                "craft ideas, or a short home workout as fits their request. "
+                "NEVER decline book, reading, recipe, craft, or home-workout requests. "
+                "For books: Book Title, Author, concise Synopsis, and quiet Reading Spots. "
+                "For recipes/hobbies: step-by-step instructions and focus benefits. "
                 f"You may mention these well-known books if they asked for reading: {classics}. "
                 "Do not invent live concert or cinema showtimes."
             )
@@ -1440,49 +1434,58 @@ def lifestyle_recommendation_node(state: State) -> dict[str, Any]:
         )
     prompt_messages.extend(_chat_for_activity_nodes(state))
     response = llm.invoke(_messages_for_gemini(prompt_messages))
-    return {"messages": [response], "city": city}
+    payload: dict[str, Any] = {"draft_response": _message_text(response).strip()}
+    if city:
+        payload["city"] = city
+    return payload
+
+
+def response_merger_node(state: State) -> dict[str, Any]:
+    """Append the final assistant message and clear ephemeral routing state."""
+    draft = (state.get("draft_response") or "").strip()
+    if not draft:
+        draft = (
+            "Tell me what offline activity you'd like — live events like cinema and "
+            "concerts, or personal resets like books, recipes, and home workouts."
+        )
+
+    intent = state.get("active_intent") or "lifestyle"
+    if not _should_skip_detox_note(draft):
+        detox = _build_detox_note(intent, _latest_user_text(state))
+        draft = f"{draft.rstrip()}\n\n**Digital Detox Note:** {detox}"
+
+    payload: dict[str, Any] = {
+        "messages": [AIMessage(content=draft)],
+        "draft_response": "",
+        "active_intent": "",
+        "activity_preference": "",
+        "preference_ready": False,
+    }
+    city = (_extract_city(state) or (state.get("city") or "")).strip()
+    if city:
+        payload["city"] = city
+    return payload
 
 
 def build_graph():
     workflow = StateGraph(State)
-    workflow.add_node("task_router", _passthrough)
-    workflow.add_node("reject_node", reject_node)
-    workflow.add_node("screen_time_node", screen_time_node)
-    workflow.add_node("activity_preference_node", activity_preference_node)
+    workflow.add_node("intent_router_node", intent_router_node)
     workflow.add_node("live_events_node", live_events_node)
     workflow.add_node("lifestyle_recommendation_node", lifestyle_recommendation_node)
+    workflow.add_node("response_merger_node", response_merger_node)
 
+    workflow.add_edge(START, "intent_router_node")
     workflow.add_conditional_edges(
-        START,
-        scope_check,
-        {
-            "reject_node": "reject_node",
-            "task_router": "task_router",
-        },
-    )
-    workflow.add_conditional_edges(
-        "task_router",
-        task_router,
-        {
-            "screen_time_node": "screen_time_node",
-            "activity_preference_node": "activity_preference_node",
-            "live_events_node": "live_events_node",
-            "lifestyle_recommendation_node": "lifestyle_recommendation_node",
-        },
-    )
-    workflow.add_edge("screen_time_node", END)
-    workflow.add_conditional_edges(
-        "activity_preference_node",
-        route_after_preference,
+        "intent_router_node",
+        route_by_intent,
         {
             "live_events_node": "live_events_node",
             "lifestyle_recommendation_node": "lifestyle_recommendation_node",
-            END: END,
         },
     )
-    workflow.add_edge("reject_node", END)
-    workflow.add_edge("live_events_node", END)
-    workflow.add_edge("lifestyle_recommendation_node", END)
+    workflow.add_edge("live_events_node", "response_merger_node")
+    workflow.add_edge("lifestyle_recommendation_node", "response_merger_node")
+    workflow.add_edge("response_merger_node", END)
     return workflow.compile()
 
 
@@ -1585,20 +1588,15 @@ def analyze_screen_time(image_file: Any | None = None, text_input: str | None = 
 
 def get_event_recommendations(city: str, hobbies: str) -> str:
     """Recommend local off-screen activities through the LangGraph workflow."""
-    city_label = (city or "").strip() or "Istanbul"
-    hobbies_label = (hobbies or "").strip() or "cinema"
-    user_message = HumanMessage(
-        content=(
-            f"I live in {city_label} and want this activity: {hobbies_label}. "
-            "Recommend current real-world alternatives to screen time."
-        )
-    )
+    city_label = (city or "").strip()
+    hobbies_label = (hobbies or "").strip() or "offline activities"
+    content = f"I want this activity: {hobbies_label}."
+    if city_label:
+        content = f"I live in {city_label} and want this activity: {hobbies_label}."
     return invoke_graph(
-        user_message,
+        HumanMessage(content=content),
         has_analyzed=True,
         city=city_label,
-        activity_preference=hobbies_label,
-        preference_ready=True,
     )
 
 
@@ -1624,8 +1622,6 @@ if __name__ == "__main__":
                 "has_analyzed": bool(persisted.get("has_analyzed")),
                 "screen_time_done": bool(persisted.get("screen_time_done")),
                 "city": persisted.get("city") or "",
-                "activity_preference": persisted.get("activity_preference") or "",
-                "preference_ready": bool(persisted.get("preference_ready")),
             }
         )
         history = list(result["messages"])
@@ -1633,7 +1629,5 @@ if __name__ == "__main__":
             "has_analyzed": result.get("has_analyzed"),
             "screen_time_done": result.get("screen_time_done"),
             "city": result.get("city"),
-            "activity_preference": result.get("activity_preference"),
-            "preference_ready": result.get("preference_ready"),
         }
         print(f"Assistant: {_last_assistant_text(result)}\n")
