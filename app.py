@@ -12,7 +12,7 @@ from ai_engine import (
 from langchain_core.messages import AIMessage, HumanMessage
 
 st.set_page_config(
-    page_title="Digital Well-Being",
+    page_title="Digital Well-Being Coach",
     page_icon="🌿",
     layout="centered",
 )
@@ -175,7 +175,7 @@ def render_sidebar() -> None:
 
 def render_onboarding_page() -> None:
     """İlk giriş ekranı: Ekran süresi verilerini alma."""
-    st.title("Digital Well-Being 🌿")
+    st.title("Digital Well-Being Coach🌿")
     st.write("Welcome! Let's start by looking at your screen time habits.")
 
     st.markdown("---")
@@ -204,7 +204,7 @@ def render_onboarding_page() -> None:
                 st.session_state.has_analyzed = True
                 append_assistant_once(insight_text)
                 st.session_state.step = "dashboard"
-                st.toast("Veriler başarıyla alındı ve analiz edildi! 🎉")
+                st.toast("Data successfully received and analyzed! 🎉")
                 st.rerun()
 
     with col2:
@@ -256,6 +256,7 @@ def render_chat() -> None:
                 st.session_state.has_analyzed or st.session_state.last_analysis
             ),
             city=_resolved_user_city(),
+            activity_preference=st.session_state.hobbies or "",
         )
         city = (result.get("city") or "").strip()
         if city:
@@ -278,7 +279,7 @@ def main() -> None:
     else:
         st.title("Digital Well-Being Dashboard")
         if st.session_state.get("has_analyzed") or st.session_state.get("last_analysis"):
-            st.success("Veriler alındı! Koçunuz sorularınızı yanıtlamaya hazır.")
+            st.success("Data received! Your coach is ready to answer your questions.")
         render_analysis_card()
         render_chat()
 
