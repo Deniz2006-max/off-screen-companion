@@ -147,28 +147,6 @@ def init_session_state() -> None:
 
 def render_sidebar() -> None:
     with st.sidebar:
-        st.header("Your context")
-        if not (st.session_state.get("city_input") or "").strip() and st.session_state.get(
-            "user_city"
-        ):
-            st.session_state.city_input = st.session_state.user_city
-        st.text_input("City", placeholder="e.g. Istanbul", key="city_input")
-        st.text_input(
-            "Hobbies",
-            placeholder="e.g. hiking, photography, chess",
-            key="hobbies",
-        )
-
-        st.markdown("---")
-
-        if st.button("🎨 Suggest Local Events", use_container_width=True):
-            events = get_event_recommendations(
-                _resolved_user_city(),
-                st.session_state.hobbies,
-            )
-            st.session_state.last_events = events
-            append_assistant_once(events)
-
         if st.session_state.step == "dashboard":
             if st.button("🔄 Restart / Upload New Screenshot", use_container_width=True):
                 st.session_state.step = "onboarding"
@@ -176,6 +154,16 @@ def render_sidebar() -> None:
                 st.session_state.last_analysis = None
                 st.session_state.has_analyzed = False
                 st.rerun()
+
+        st.markdown("---")
+
+        st.caption(
+            "⚠️ **Disclaimer:** This application is provided for awareness and digital well-being guidance purposes only. "
+            "The generated recommendations are created by artificial intelligence and do not constitute professional "
+            "medical/psychological advice. Uploaded data is not stored after processing."
+        )
+
+        st.markdown("---")
 
         st.selectbox(
             "Theme 🎨",
@@ -221,6 +209,8 @@ def render_onboarding_page() -> None:
 
     with col2:
         if st.button("Skip for now ➡️", use_container_width=True):
+            st.session_state.has_analyzed = False
+            st.session_state.last_analysis = None
             st.session_state.step = "dashboard"
             st.rerun()
 
@@ -277,16 +267,6 @@ def render_chat() -> None:
         st.markdown(reply)
 
 
-def render_disclaimer() -> None:
-    """Ortadaki alanın en altına estetik bir sorumluluk reddi metni ekler."""
-    st.markdown("---")
-    st.caption(
-        "⚠️ **Sorumluluk Reddi:** Bu uygulama yalnızca farkındalık ve dijital refah rehberliği "
-        "amacıyla sunulmaktadır. Üretilen tavsiyeler yapay zeka tarafından oluşturulmuştur ve "
-        "profesyonel tıbbi/psikolojik tavsiye niteliği taşımaz. Yüklenen veriler işlendikten sonra saklanmaz."
-    )
-
-
 def main() -> None:
     init_session_state()
     apply_custom_theme(st.session_state.theme)
@@ -298,11 +278,10 @@ def main() -> None:
         render_onboarding_page()
     else:
         st.title("Digital Well-Being Dashboard")
-        st.success("Veriler alındı! Koçunuz sorularınızı yanıtlamaya hazır.")
+        if st.session_state.get("has_analyzed") or st.session_state.get("last_analysis"):
+            st.success("Veriler alındı! Koçunuz sorularınızı yanıtlamaya hazır.")
         render_analysis_card()
         render_chat()
-
-    render_disclaimer()
 
 
 if __name__ == "__main__":
