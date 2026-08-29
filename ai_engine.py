@@ -39,7 +39,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.6-flash"
 REJECT_REPLY = (
     "I am designed to assist only with screen time, time management, digital "
     "balance, and finding local activities to replace screen time. How can I "
