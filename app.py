@@ -117,14 +117,26 @@ def _graph_history() -> list:
     return history
 
 
+def _resolved_user_city() -> str:
+    """Prefer chat-persisted city; fall back to sidebar input."""
+    return (
+        st.session_state.get("user_city")
+        or st.session_state.get("city_input")
+        or ""
+    ).strip()
+
+
 def init_session_state() -> None:
+    if "city" in st.session_state and not st.session_state.get("user_city"):
+        st.session_state.user_city = st.session_state.pop("city")
+
     defaults: dict[str, object] = {
         "step": "onboarding",  # 'onboarding' veya 'dashboard'
         "messages": [],
         "last_analysis": None,
         "last_events": None,
         "has_analyzed": False,
-        "city": "",
+        "user_city": "",
         "hobbies": "",
         "theme": "Pastel Sage 🌿",
     }
@@ -136,7 +148,11 @@ def init_session_state() -> None:
 def render_sidebar() -> None:
     with st.sidebar:
         st.header("Your context")
-        st.text_input("City", placeholder="e.g. Istanbul", key="city")
+        if not (st.session_state.get("city_input") or "").strip() and st.session_state.get(
+            "user_city"
+        ):
+            st.session_state.city_input = st.session_state.user_city
+        st.text_input("City", placeholder="e.g. Istanbul", key="city_input")
         st.text_input(
             "Hobbies",
             placeholder="e.g. hiking, photography, chess",
@@ -147,7 +163,7 @@ def render_sidebar() -> None:
 
         if st.button("🎨 Suggest Local Events", use_container_width=True):
             events = get_event_recommendations(
-                st.session_state.city,
+                _resolved_user_city(),
                 st.session_state.hobbies,
             )
             st.session_state.last_events = events
@@ -249,12 +265,12 @@ def render_chat() -> None:
             has_analyzed=bool(
                 st.session_state.has_analyzed or st.session_state.last_analysis
             ),
-            city=st.session_state.city or "",
+            city=_resolved_user_city(),
             activity_preference=st.session_state.hobbies or "",
         )
         city = (result.get("city") or "").strip()
         if city:
-            st.session_state.city = city
+            st.session_state.user_city = city
         reply = last_assistant_reply(result)
     append_assistant_once(reply)
     with st.chat_message("assistant"):
