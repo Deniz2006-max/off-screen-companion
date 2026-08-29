@@ -11,9 +11,15 @@ load_dotenv(dotenv_path=env_path, override=True)
 
 # Fetch and strip any hidden spaces
 tavily_key = (os.getenv("TAVILY_API_KEY") or "").strip()
+google_api_key = (
+    (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+)
 
 if not tavily_key:
     raise ValueError("TAVILY_API_KEY is empty or invalid in .env file.")
+if not google_api_key:
+    raise ValueError("GOOGLE_API_KEY is empty or invalid in .env file.")
+os.environ["GOOGLE_API_KEY"] = google_api_key
 
 from langchain_tavily import TavilySearch
 
@@ -23,16 +29,17 @@ search_tool = TavilySearch(
 )
 
 import base64
+import re
 from io import BytesIO
 from typing import Annotated, Any, Literal, TypedDict
 
 from PIL import Image
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-MODEL_NAME = "gpt-4o"
+MODEL_NAME = "gemini-1.5-flash"
 REJECT_REPLY = (
     "I am designed to assist only with screen time, time management, digital "
     "balance, and finding local activities to replace screen time. How can I "
@@ -65,8 +72,8 @@ Reply in clear markdown the UI can display:
 
 If only text notes are provided, extract the same structure from the notes.
 
-After the structured breakdown, ALWAYS end with a proactive transition question asking for their city and whether they prefer indoor activities (movies, theater, book cafes) or outdoor activities (nature walks, concerts). Use this exact question:
-To give you the best screen-free recommendations, would you prefer indoor activities (like movies, theater, or reading spots) or outdoor activities (like nature walks or concerts)? Also, which city are you located in?
+After the structured breakdown, ALWAYS end with this exact open-ended question (do not replace it with an indoor/outdoor binary):
+Ekran süreniz dışındaki zamanı değerlendirmek için bugün/bu hafta sonu nasıl bir aktivite yapmak istersiniz ve hangi şehirdesiniz? (Örn: İstanbul'da sergi gezmek, tiyatroya gitmek, sakince kitap okumak veya doğa yürüyüşü yapmak gibi)
 
 Do not recommend specific local events, movies, or venues in this step.
 
@@ -80,23 +87,23 @@ EVENT_RECOMMENDATIONS_SYSTEM_PROMPT = """
 Role: You are a hybrid local-activity guide for digital well-being: live Tavily facts plus creative, personalized reasoning.
 
 Hybrid method:
-1. Ground names, venues, dates, movies, and events in the Tavily search context or widely recognized real-world classics/blockbusters.
-2. Use creative LLM reasoning to personalize why each idea is a good screen-free swap (fit the user's city, indoor/outdoor preference, and prior screen-time context).
-3. Support multi-turn follow-ups: if the user asks more about a recommendation (hours, which option if they are tired, how to get there, another similar idea), stay on that thread and answer helpfully. Run with new search facts when they ask for updated listings.
+1. Ground names, venues, dates, and events in the Tavily search context or widely recognized real-world places.
+2. Follow the user's exact preference — museums, theater, coffee shops, workshops, walks, reading, or anything else they named — do not collapse them into a rigid indoor/outdoor menu.
+3. Use LLM intelligence to explain why each idea is a good, engaging screen-free swap for this person, this city, and this weekend/today.
+4. Support multi-turn follow-ups: if they ask more about a recommendation, stay on that thread. Search again when they want fresh listings.
 
 If search results are ambiguous or lack a specific live schedule:
-- Do NEVER invent fake film names, fictional event dates, non-existent plays, or made-up venue locations.
-- Recommend well-known, verified local venues (e.g. Atlas 1948, Kadıköy Sineması, Zorlu PSM, DasDas, Belgrat Ormanı, Atatürk Kent Ormanı, iconic book cafes) and suggest checking their current schedules.
+- Do NEVER invent fake event names, fictional dates, or made-up venue locations.
+- Recommend well-known, verified local venues that match the requested activity and suggest checking their current schedules.
 
-Category focus: prefer the activity type in the user's latest message (books, movies, concerts, theater, or outdoor), while still answering follow-up questions about ideas you already suggested.
-
-Keep the tone encouraging and non-judgmental. Invite another follow-up at the end (e.g. a different neighborhood or indoor vs outdoor).
+Keep the tone encouraging and non-judgmental. Invite another follow-up at the end.
 """
 
 PREFERENCE_PROMPT = (
-    "To give you the best screen-free recommendations, would you prefer indoor "
-    "activities (like movies, theater, or reading spots) or outdoor activities "
-    "(like nature walks or concerts)? Also, which city are you located in?"
+    "Ekran süreniz dışındaki zamanı değerlendirmek için bugün/bu hafta sonu "
+    "nasıl bir aktivite yapmak istersiniz ve hangi şehirdesiniz? "
+    "(Örn: İstanbul'da sergi gezmek, tiyatroya gitmek, sakince kitap okumak "
+    "veya doğa yürüyüşü yapmak gibi)"
 )
 
 SCOPE_ROUTER_PROMPT = """
@@ -158,6 +165,12 @@ FOLLOWUP_CUES = (
     "outdoor",
     "which city",
     "şehir",
+    "sehirdesiniz",
+    "şehirdesiniz",
+    "hangi şehirdesiniz",
+    "ekran süreniz dışındaki",
+    "nasıl bir aktivite",
+    "bugün/bu hafta sonu",
     "hobi",
     "activity",
     "activities",
@@ -310,17 +323,18 @@ class State(TypedDict, total=False):
     activity_preference: str
     preference_ready: bool
     screen_time_done: bool
+    has_analyzed: bool
 
 
-llm = ChatOpenAI(
+llm = ChatGoogleGenerativeAI(
     model=MODEL_NAME,
-    temperature=0.4,
-    api_key=(os.getenv("OPENAI_API_KEY") or "").strip() or None,
+    temperature=0.2,
+    google_api_key=google_api_key,
 )
-router_llm = ChatOpenAI(
+router_llm = ChatGoogleGenerativeAI(
     model=MODEL_NAME,
-    temperature=0,
-    api_key=(os.getenv("OPENAI_API_KEY") or "").strip() or None,
+    temperature=0.2,
+    google_api_key=google_api_key,
 )
 
 
@@ -337,6 +351,92 @@ def _message_text(message: Any) -> str:
                 parts.append(str(item.get("text", "")))
         return "\n".join(p for p in parts if p)
     return str(content or "")
+
+
+def _parse_data_url(value: str) -> tuple[str, str] | None:
+    if not value.startswith("data:") or ";base64," not in value:
+        return None
+    header, encoded = value.split(";base64,", 1)
+    mime = header[5:].strip() or "image/png"
+    encoded = encoded.strip()
+    if not encoded:
+        return None
+    return mime, encoded
+
+
+def _gemini_image_part(part: dict[str, Any]) -> dict[str, Any]:
+    """Normalize OpenAI-style and media image blocks for Gemini Vision."""
+    part_type = str(part.get("type") or "")
+    mime = str(part.get("mime_type") or part.get("mime") or "").strip()
+    raw_data = part.get("data") or part.get("base64")
+    image_url = part.get("image_url") or part.get("url")
+
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url") or image_url.get("uri") or ""
+    url = str(image_url or "").strip()
+
+    if url:
+        parsed = _parse_data_url(url)
+        if parsed:
+            mime, raw_data = parsed
+            url = f"data:{mime};base64,{raw_data}"
+        return {"type": "image_url", "image_url": url}
+
+    if raw_data:
+        if isinstance(raw_data, bytes):
+            raw_data = base64.b64encode(raw_data).decode("utf-8")
+        mime = mime or "image/png"
+        return {"type": "image_url", "image_url": f"data:{mime};base64,{raw_data}"}
+
+    if part_type in {"image_url", "image", "media"}:
+        return part
+    return part
+
+
+def _normalize_content_for_gemini(content: Any) -> Any:
+    if not isinstance(content, list):
+        return content
+    normalized: list[Any] = []
+    for item in content:
+        if isinstance(item, dict) and (
+            item.get("type") in {"image_url", "image", "media"}
+            or "image_url" in item
+            or str(item.get("mime_type") or "").startswith("image/")
+        ):
+            normalized.append(_gemini_image_part(item))
+        else:
+            normalized.append(item)
+    return normalized
+
+
+def _clone_message_with_content(message: Any, content: Any) -> Any:
+    if isinstance(message, HumanMessage):
+        return HumanMessage(content=content)
+    if isinstance(message, SystemMessage):
+        return SystemMessage(content=content)
+    if isinstance(message, AIMessage):
+        return AIMessage(content=content)
+    return message
+
+
+def _messages_for_gemini(messages: list[Any]) -> list[Any]:
+    ready: list[Any] = []
+    for message in messages:
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                updated = dict(message)
+                updated["content"] = _normalize_content_for_gemini(content)
+                ready.append(updated)
+            else:
+                ready.append(message)
+            continue
+        content = getattr(message, "content", None)
+        if isinstance(content, list):
+            ready.append(_clone_message_with_content(message, _normalize_content_for_gemini(content)))
+        else:
+            ready.append(message)
+    return ready
 
 
 def _is_human(message: Any) -> bool:
@@ -415,7 +515,9 @@ def _is_offline_hobby_request(state: State) -> bool:
 
 def _classify(system_prompt: str, state: State, valid: set[str], default: str) -> str:
     response = router_llm.invoke(
-        [SystemMessage(content=system_prompt), *_history_for_router(state)]
+        _messages_for_gemini(
+            [SystemMessage(content=system_prompt), *_history_for_router(state)]
+        )
     )
     token = _message_text(response).strip().split()[0].upper().replace("-", "_")
     return token if token in valid else default
@@ -437,20 +539,62 @@ def _extract_city_from_text(text: str) -> str:
     return ""
 
 
-def _extract_preference_from_text(text: str) -> str:
-    blob = (text or "").lower()
-    indoor = any(cue in blob for cue in INDOOR_CUES)
-    outdoor = any(cue in blob for cue in OUTDOOR_CUES)
-    if indoor and outdoor:
-        if "outdoor" in blob or "açık hava" in blob or "acik hava" in blob:
-            return "outdoor"
-        if "indoor" in blob:
-            return "indoor"
-        return "both"
-    if indoor:
-        return "indoor"
-    if outdoor:
-        return "outdoor"
+ACTIVITY_ANSWER_CUES = (
+    "indoor",
+    "outdoor",
+    "museum",
+    "müze",
+    "muze",
+    "sergi",
+    "exhibition",
+    "theater",
+    "theatre",
+    "tiyatro",
+    "coffee",
+    "kahve",
+    "cafe",
+    "kafe",
+    "workshop",
+    "atölye",
+    "atolye",
+    "walk",
+    "yürüyüş",
+    "yuruyus",
+    "hike",
+    "hiking",
+    "park",
+    "doğa",
+    "doga",
+    "kitap",
+    "read",
+    "reading",
+    "concert",
+    "konser",
+    "cinema",
+    "sinema",
+    "film",
+    "movie",
+    "craft",
+    "cooking",
+    "journal",
+)
+
+
+def _extract_preference_from_text(text: str, *, allow_freeform: bool = False) -> str:
+    blob = (text or "").strip()
+    if not blob:
+        return ""
+    remainder = blob
+    for needle in sorted(CITY_ALIASES, key=len, reverse=True):
+        remainder = re.sub(re.escape(needle), " ", remainder, flags=re.IGNORECASE)
+    remainder = re.sub(r"\s+", " ", remainder).strip(" ,.;:-")
+    lower = remainder.lower()
+    if not remainder:
+        return ""
+    if any(cue in lower for cue in ACTIVITY_ANSWER_CUES):
+        return remainder
+    if allow_freeform and len(remainder) >= 4:
+        return remainder
     return ""
 
 
@@ -460,21 +604,18 @@ def _latest_has_city_or_setting_cue(state: State) -> bool:
         return False
     if _extract_city_from_text(latest):
         return True
-    return any(
-        cue in latest
-        for cue in ("indoor", "outdoor", "iç mekan", "acik hava", "açık hava")
-    )
+    return any(cue in latest for cue in ACTIVITY_ANSWER_CUES)
 
 
-def _screen_time_already_done(state: State) -> bool:
-    if state.get("screen_time_done"):
-        return True
+def _analysis_in_history(state: State) -> bool:
     markers = (
         "**total screen time**",
         "total screen time:",
         "**detox suggestion**",
         "detox suggestion:",
         "which city are you located",
+        "hangi şehirdesiniz",
+        "ekran süreniz dışındaki",
         PREFERENCE_PROMPT.lower()[:48],
     )
     for message in state.get("messages", []):
@@ -484,6 +625,12 @@ def _screen_time_already_done(state: State) -> bool:
         if any(marker in text for marker in markers):
             return True
     return False
+
+
+def _has_analyzed(state: State) -> bool:
+    if state.get("has_analyzed") or state.get("screen_time_done"):
+        return True
+    return _analysis_in_history(state)
 
 
 def _extract_city(state: State) -> str:
@@ -510,83 +657,55 @@ def _latest_focus_category(state: State) -> str:
     latest = _latest_user_text(state).lower()
     if any(cue in latest for cue in HOME_READING_CUES):
         return "reading"
+    if any(cue in latest for cue in ("museum", "müze", "muze", "sergi", "exhibition")):
+        return "museum"
+    if any(cue in latest for cue in ("coffee", "kahve", "cafe", "kafe")):
+        return "coffee"
+    if any(cue in latest for cue in ("workshop", "atölye", "atolye")):
+        return "workshop"
     if any(cue in latest for cue in ("cinema", "movie", "film", "sinema", "vizyon")):
         return "cinema"
     if any(cue in latest for cue in ("concert", "konser")):
         return "concerts"
     if any(cue in latest for cue in ("tiyatro", "theater", "theatre", "play", "psm", "dasdas")):
         return "theater"
-    if any(cue in latest for cue in ("hike", "hiking", "park", "walk", "doğa", "orman", "forest")):
+    if any(cue in latest for cue in ("hike", "hiking", "park", "walk", "doğa", "orman", "forest", "yürüyüş")):
         return "outdoor"
-    if "outdoor" in latest:
-        return "outdoor"
-    if "indoor" in latest:
-        return "indoor"
-
-    user_blob = _user_conversation_text(state).lower()
-    if any(cue in user_blob for cue in HOME_READING_CUES):
-        return "reading"
     preference = _extract_activity_preference(state)
-    if preference == "outdoor":
-        return "outdoor"
-    if preference == "indoor":
-        return "indoor"
-    return "indoor"
+    return preference or "offline activities"
 
 
-def _preference_categories(preference: str, focus: str) -> list[str]:
-    if focus == "reading":
-        return ["reading"]
-    if focus == "cinema":
-        return ["cinema"]
-    if focus == "concerts":
-        return ["concerts"]
-    if focus == "theater":
-        return ["theater"]
-    if focus == "outdoor":
-        return ["outdoor"]
-    if preference == "indoor":
-        return ["cinema", "theater", "reading"]
-    if preference == "outdoor":
-        return ["concerts", "outdoor"]
-    return ["cinema", "theater"]
-
-
-def _category_search_queries(city: str) -> dict[str, list[str]]:
+def _preference_search_queries(city: str, preference: str) -> list[str]:
     city_q = city or "Istanbul"
-    reading_queries = [
-        f"{city_q} best quiet book cafes",
-        "best historical fiction novels recommended",
+    pref = (preference or "screen-free activities").strip()
+    queries = [
+        f"{city_q} {pref} this weekend live events venues 2026",
+        f"{city_q} {pref} güncel yerler etkinlikler bu hafta sonu",
     ]
-    if city_q.lower() in {"istanbul", "i̇stanbul"}:
-        return {
-            "cinema": [
-                "current popular movies in cinemas Istanbul 2026",
-                "vizyondaki en popüler filmler istanbul Paribu Cineverse",
-            ],
-            "concerts": [
-                "Istanbul outdoor concerts Harbiye Kucukciftlik Park 2026",
-                "istanbul konser takvimi bu hafta açık hava",
-            ],
-            "theater": [
-                "istanbul tiyatro oyunları gösteriler bu ay Zorlu PSM DasDas",
-                "istanbul kitap kafe güncel sergiler müzeler",
-            ],
-            "outdoor": [
-                "istanbul güncel açık hava yürüyüş rotaları parklar Belgrad ormanı",
-            ],
-            "reading": reading_queries,
-        }
-    return {
-        "cinema": [
-            f"current popular movies in cinemas {city_q} 2026",
-            f"vizyondaki en popüler filmler {city_q} Paribu Cineverse",
-        ],
-        "concerts": [f"{city_q} outdoor concerts open-air this week 2026"],
-        "theater": [f"{city_q} theater plays book cafes exhibitions this month"],
-        "outdoor": [f"{city_q} nature walks parks outdoor events this week"],
-        "reading": reading_queries,
-    }
+    lower = pref.lower()
+    if any(cue in lower for cue in ("museum", "müze", "muze", "sergi", "exhibition")):
+        queries.append(f"{city_q} current museum exhibitions galleries this week")
+    if any(cue in lower for cue in ("coffee", "kahve", "cafe", "kafe")):
+        queries.append(f"{city_q} best specialty coffee shops book cafes")
+    if any(cue in lower for cue in ("workshop", "atölye", "atolye")):
+        queries.append(f"{city_q} creative workshops classes this weekend")
+    if any(cue in lower for cue in ("walk", "yürüyüş", "yuruyus", "doğa", "hike", "park")):
+        queries.append(f"{city_q} walking trails parks nature routes")
+    if any(cue in lower for cue in ("tiyatro", "theater", "theatre")):
+        queries.append(f"{city_q} theater plays this week")
+    if any(cue in lower for cue in ("kitap", "read", "book", "reading")):
+        queries.append(f"{city_q} book cafes quiet reading spots")
+    if any(cue in lower for cue in ("cinema", "sinema", "film", "movie")):
+        queries.append(f"{city_q} current popular movies in cinemas")
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for query in queries:
+        if query in seen:
+            continue
+        seen.add(query)
+        unique.append(query)
+    return unique[:4]
 
 
 def _clean_tavily_results(raw: Any) -> str:
@@ -620,23 +739,23 @@ def _run_tavily_query(search_query: str) -> str:
         return ""
 
 
-def _run_category_searches(state: State) -> tuple[str, bool, list[str]]:
+def _run_preference_searches(state: State) -> tuple[str, bool, list[str]]:
     city = _extract_city(state) or "Istanbul"
-    preference = _extract_activity_preference(state) or "indoor"
-    focus = _latest_focus_category(state)
-    categories = _preference_categories(preference, focus)
-    queries = _category_search_queries(city)
+    preference = (
+        _extract_activity_preference(state)
+        or _latest_user_text(state)
+        or "screen-free activities"
+    )
+    queries = _preference_search_queries(city, preference)
     chunks: list[str] = []
     any_hits = False
-
-    for category in categories:
-        for search_query in queries.get(category, [])[:2]:
-            result = _run_tavily_query(search_query)
-            if not result:
-                continue
-            any_hits = True
-            chunks.append(f"[{category}] {search_query}\n{result[:1500]}")
-    return "\n\n".join(chunks), any_hits, categories
+    for search_query in queries:
+        result = _run_tavily_query(search_query)
+        if not result:
+            continue
+        any_hits = True
+        chunks.append(f"[{preference}] {search_query}\n{result[:1500]}")
+    return "\n\n".join(chunks), any_hits, queries
 
 
 def _latest_human_message(state: State) -> Any | None:
@@ -650,7 +769,12 @@ def _message_has_image(message: Any) -> bool:
     content = getattr(message, "content", None)
     if isinstance(content, list):
         return any(
-            isinstance(part, dict) and part.get("type") == "image_url"
+            isinstance(part, dict)
+            and (
+                part.get("type") in {"image_url", "image", "media"}
+                or "image_url" in part
+                or str(part.get("mime_type") or "").startswith("image/")
+            )
             for part in content
         )
     return False
@@ -661,10 +785,12 @@ def _image_is_irrelevant(state: State) -> bool:
     if message is None or not _message_has_image(message):
         return False
     response = router_llm.invoke(
-        [
-            SystemMessage(content=IMAGE_SCOPE_PROMPT),
-            message,
-        ]
+        _messages_for_gemini(
+            [
+                SystemMessage(content=IMAGE_SCOPE_PROMPT),
+                message,
+            ]
+        )
     )
     token = _message_text(response).strip().split()[0].upper().replace("-", "_")
     return token == "IRRELEVANT_IMAGE"
@@ -685,7 +811,7 @@ def scope_check(state: State) -> Literal["reject_node", "task_router"]:
 
     if (
         _latest_has_city_or_setting_cue(state)
-        or _screen_time_already_done(state)
+        or _has_analyzed(state)
         or _preference_fields_ready(state)
         or _assistant_asked_for_location_or_hobbies(state)
     ):
@@ -704,24 +830,21 @@ def scope_check(state: State) -> Literal["reject_node", "task_router"]:
 
 def task_router(
     state: State,
-) -> Literal["screen_time_node", "activity_preference_node"]:
-    """Send city/preference answers to the preference gate, never back to analysis."""
+) -> Literal["screen_time_node", "activity_preference_node", "event_finder_node"]:
+    """Never re-run analysis after has_analyzed; send later text to preference or events."""
+    if _has_analyzed(state):
+        if _preference_fields_ready(state):
+            return "event_finder_node"
+        return "activity_preference_node"
+
     missing_in_state = not (
         (state.get("city") or "").strip()
         and (state.get("activity_preference") or "").strip()
     )
-
-    # City / indoor / outdoor replies skip analysis when state fields are empty.
     if missing_in_state and _latest_has_city_or_setting_cue(state):
         return "activity_preference_node"
-
-    # After analysis exists, later turns never re-enter screen_time_node.
-    if _screen_time_already_done(state):
-        return "activity_preference_node"
-
     if _preference_fields_ready(state) or _assistant_asked_for_location_or_hobbies(state):
         return "activity_preference_node"
-
     return "screen_time_node"
 
 
@@ -741,7 +864,7 @@ def reject_node(state: State) -> dict[str, list[AIMessage]]:
 
 
 def screen_time_node(state: State) -> dict[str, list[BaseMessage]]:
-    """Extract screen-time stats, then ask for city and indoor/outdoor preference."""
+    """Extract screen-time stats, then ask an open-ended city/activity question."""
     prompt_messages: list[BaseMessage] = [
         SystemMessage(content=ANALYZE_SCREEN_TIME_SYSTEM_PROMPT)
     ]
@@ -752,17 +875,19 @@ def screen_time_node(state: State) -> dict[str, list[BaseMessage]]:
                     "A screen-time screenshot is attached. Read the image carefully and "
                     "extract total active hours plus the top 3-4 apps with their exact "
                     "durations before writing equivalents or a detox suggestion. "
-                    "End by asking for city and indoor/outdoor preference."
+                    "End with the open-ended question about what activity they want "
+                    "today/this weekend and which city they are in."
                 )
             )
         )
     prompt_messages.extend(state["messages"])
-    response = llm.invoke(prompt_messages)
+    response = llm.invoke(_messages_for_gemini(prompt_messages))
     analysis = _message_text(response).strip()
     if PREFERENCE_PROMPT.lower() not in analysis.lower():
         analysis = f"{analysis}\n\n{PREFERENCE_PROMPT}"
     return {
         "messages": [AIMessage(content=analysis)],
+        "has_analyzed": True,
         "screen_time_done": True,
     }
 
@@ -776,7 +901,7 @@ def activity_preference_node(state: State) -> dict[str, Any]:
         or _extract_city(state)
     )
     preference = (
-        _extract_preference_from_text(latest)
+        _extract_preference_from_text(latest, allow_freeform=True)
         or (state.get("activity_preference") or "").strip()
         or _extract_activity_preference(state)
     )
@@ -792,7 +917,9 @@ def activity_preference_node(state: State) -> dict[str, Any]:
         last is not None
         and _is_ai(last)
         and (
-            "which city" in _message_text(last).lower()
+            "hangi şehirdesiniz" in _message_text(last).lower()
+            or "ekran süreniz dışındaki" in _message_text(last).lower()
+            or "which city" in _message_text(last).lower()
             or "hangi şehir" in _message_text(last).lower()
         )
     )
@@ -819,37 +946,27 @@ def route_after_preference(state: State) -> Literal["event_finder_node", "__end_
 
 def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
     city = _extract_city(state) or "your city"
-    preference = _extract_activity_preference(state) or "indoor"
+    preference = (
+        _extract_activity_preference(state)
+        or _latest_user_text(state)
+        or "screen-free activities"
+    )
     focus = _latest_focus_category(state)
-    live_results, has_live_data, categories = _run_category_searches(state)
+    live_results, has_live_data, queries = _run_preference_searches(state)
     classics = "; ".join(CLASSIC_HISTORICAL_NOVELS)
     verified = (
         "Atlas 1948, Kadıköy Sineması, Paribu Cineverse, Zorlu PSM, DasDas, "
-        "Belgrat Ormanı, Atatürk Kent Ormanı, and well-known book cafes in the city"
+        "Belgrat Ormanı, Atatürk Kent Ormanı, Istanbul Modern, Pera Museum, "
+        "and well-known book cafes or specialty coffee shops in the city"
     )
-
-    isolation = {
-        "reading": (
-            "The user asked for books/reading. Suggest ONLY real book titles/authors "
-            "and reading spots. No movies, concerts, or hikes."
-        ),
-        "cinema": (
-            "The user asked for movies. Suggest ONLY cinemas and films named in search "
-            "results. No invented titles."
-        ),
-        "concerts": "The user asked for concerts. Suggest ONLY real concert venues/events.",
-        "theater": "The user asked for theater. Suggest ONLY real stages/plays.",
-        "outdoor": (
-            "The user asked for outdoor/nature. Suggest ONLY parks, forests, and walks."
-        ),
-        "indoor": (
-            "The user chose indoor. Stay on movies, theater, reading spots, and indoor venues."
-        ),
-    }.get(focus, "Stay on the requested activity type only.")
-
+    isolation = (
+        f"The user asked for: {preference} (focus hint: {focus}). "
+        "Recommend ONLY real venues/events that match this specific interest "
+        "in their city. Do not force an indoor/outdoor binary or unrelated categories."
+    )
     fallback = (
         f"Search is missing live schedules. Do not invent titles or dates. "
-        f"Point the user to verified spots in {city}: {verified}. "
+        f"Point the user to verified spots in {city} that fit '{preference}': {verified}. "
         "Invite them to check those venues' current programs. "
         f"If they asked for books, you may name these classics only: {classics}."
     )
@@ -858,11 +975,10 @@ def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
         SystemMessage(content=EVENT_RECOMMENDATIONS_SYSTEM_PROMPT),
         SystemMessage(
             content=(
-                f"City: {city}. Indoor/outdoor preference: {preference}. "
-                f"This-turn focus: {focus}. Categories searched: {', '.join(categories)}. "
-                f"{isolation} "
-                "HYBRID: use Tavily for real venues/dates/movies/events, then add "
-                "personalized, creative reasons these are good screen-free plans. "
+                f"City: {city}. User preference (use this exactly): {preference}. "
+                f"Tavily queries used: {'; '.join(queries)}. {isolation} "
+                "HYBRID: ground names/dates/venues in Tavily results, then add "
+                "personalized, engaging reasons these are good screen-free plans. "
                 "If this is a follow-up, answer the user's question about the prior "
                 "recommendations; search again when they need fresh listings. "
                 "Never invent titles or dates that are not in search or widely known. "
@@ -883,7 +999,7 @@ def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
     else:
         prompt_messages.append(SystemMessage(content=fallback))
     prompt_messages.extend(state["messages"])
-    response = llm.invoke(prompt_messages)
+    response = llm.invoke(_messages_for_gemini(prompt_messages))
     return {"messages": [response]}
 
 
@@ -909,6 +1025,7 @@ def build_graph():
         {
             "screen_time_node": "screen_time_node",
             "activity_preference_node": "activity_preference_node",
+            "event_finder_node": "event_finder_node",
         },
     )
     workflow.add_edge("screen_time_node", "activity_preference_node")
@@ -963,10 +1080,15 @@ def _last_assistant_text(result: State) -> str:
     return ""
 
 
-def invoke_graph(user_message: HumanMessage, history: list | None = None) -> str:
+def invoke_graph(
+    user_message: HumanMessage,
+    history: list | None = None,
+    **state_fields: Any,
+) -> str:
     messages = list(history or [])
     messages.append(user_message)
-    result = well_being_graph.invoke({"messages": messages})
+    payload: dict[str, Any] = {"messages": messages, **state_fields}
+    result = well_being_graph.invoke(payload)
     return _last_assistant_text(result)
 
 
@@ -989,7 +1111,7 @@ def analyze_screen_time(image_file: Any | None = None, text_input: str | None = 
                     "specific durations from this screenshot."
                 ),
             },
-            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "image_url", "image_url": data_url},
         ]
         user_message = HumanMessage(content=content)
     else:
@@ -1009,20 +1131,24 @@ def get_event_recommendations(city: str, hobbies: str) -> str:
     """Recommend local off-screen activities through the LangGraph workflow."""
     city_label = (city or "").strip() or "Istanbul"
     hobbies_label = (hobbies or "").strip() or "cinema"
-    setting = "outdoor" if any(
-        cue in hobbies_label.lower() for cue in ("hike", "walk", "park", "outdoor", "nature")
-    ) else "indoor"
     user_message = HumanMessage(
         content=(
-            f"I prefer {setting} activities. I live in {city_label} and enjoy "
-            f"{hobbies_label}. Recommend current real-world alternatives to screen time."
+            f"I live in {city_label} and want this activity: {hobbies_label}. "
+            "Recommend current real-world alternatives to screen time."
         )
     )
-    return invoke_graph(user_message)
+    return invoke_graph(
+        user_message,
+        has_analyzed=True,
+        city=city_label,
+        activity_preference=hobbies_label,
+        preference_ready=True,
+    )
 
 
 if __name__ == "__main__":
     history: list[BaseMessage] = []
+    persisted: dict[str, Any] = {}
     print("Digital well-being assistant (LangGraph)")
     print("Topics: screen time, time management, digital balance, local activities.")
     print("Type q, exit, or quit to leave.\n")
@@ -1036,6 +1162,22 @@ if __name__ == "__main__":
             continue
 
         history.append(HumanMessage(content=user_input))
-        result = well_being_graph.invoke({"messages": history})
+        result = well_being_graph.invoke(
+            {
+                "messages": history,
+                "has_analyzed": bool(persisted.get("has_analyzed")),
+                "screen_time_done": bool(persisted.get("screen_time_done")),
+                "city": persisted.get("city") or "",
+                "activity_preference": persisted.get("activity_preference") or "",
+                "preference_ready": bool(persisted.get("preference_ready")),
+            }
+        )
         history = list(result["messages"])
+        persisted = {
+            "has_analyzed": result.get("has_analyzed"),
+            "screen_time_done": result.get("screen_time_done"),
+            "city": result.get("city"),
+            "activity_preference": result.get("activity_preference"),
+            "preference_ready": result.get("preference_ready"),
+        }
         print(f"Assistant: {_last_assistant_text(result)}\n")
