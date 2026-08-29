@@ -1,4 +1,12 @@
 streamlit
 google-genai
+openai
+langchain
+langchain-openai
+langchain-core
+langchain-community
+langchain-tavily
+tavily-python
+langgraph
 pillow
 python-dotenv
