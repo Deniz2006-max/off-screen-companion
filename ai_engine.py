@@ -120,6 +120,9 @@ PREFERENCE_PROMPT = (
     "To make the most of your offline time, what kind of activity would you like "
     "to do today/this weekend, and which city are you located in?"
 )
+CITY_ASK_PROMPT = (
+    "Which city are you currently in so I can find the best local options for you?"
+)
 
 SCOPE_ROUTER_PROMPT = """
 You are a conversation-aware scope classifier for a digital well-being assistant.
@@ -180,6 +183,8 @@ FOLLOWUP_CUES = (
     "outdoor",
     "which city",
     "which city are you located",
+    "which city are you currently in",
+    "best local options for you",
     "offline time",
     "today/this weekend",
     "şehir",
@@ -332,6 +337,17 @@ CITY_ALIASES = {
     "ankara": "Ankara",
     "izmir": "Izmir",
     "i̇zmir": "Izmir",
+    "london": "London",
+    "paris": "Paris",
+    "berlin": "Berlin",
+    "vienna": "Vienna",
+    "amsterdam": "Amsterdam",
+    "rome": "Rome",
+    "madrid": "Madrid",
+    "athens": "Athens",
+    "bodrum": "Bodrum",
+    "antalya": "Antalya",
+    "bursa": "Bursa",
 }
 
 
@@ -617,12 +633,12 @@ def _extract_preference_from_text(text: str, *, allow_freeform: bool = False) ->
 
 
 def _latest_has_city_or_setting_cue(state: State) -> bool:
-    latest = _latest_user_text(state).lower()
+    latest = _latest_user_text(state)
     if not latest:
         return False
-    if _extract_city_from_text(latest):
+    if _extract_city_from_text(latest) or _city_from_short_reply(latest, state):
         return True
-    return any(cue in latest for cue in ACTIVITY_ANSWER_CUES)
+    return any(cue in latest.lower() for cue in ACTIVITY_ANSWER_CUES)
 
 
 def _analysis_in_history(state: State) -> bool:
@@ -653,14 +669,62 @@ def _has_analyzed(state: State) -> bool:
     return _analysis_in_history(state)
 
 
+def _assistant_asked_for_city(state: State) -> bool:
+    previous = _last_assistant_before_user(state).lower()
+    return (
+        CITY_ASK_PROMPT.lower() in previous
+        or "which city are you currently in" in previous
+        or "best local options for you" in previous
+    )
+
+
+def _city_from_short_reply(text: str, state: State) -> str:
+    blob = (text or "").strip()
+    if not blob:
+        return ""
+    located = re.search(
+        r"\b(?:i(?:['’])?m\s+in|i am in|i live in|live in|currently in|located in)\s+"
+        r"([A-Za-zÀ-ÿçğıöşüÇĞİÖŞÜ][A-Za-zÀ-ÿçğıöşüÇĞİÖŞÜ'\-]*"
+        r"(?:\s+[A-Za-zÀ-ÿçğıöşüÇĞİÖŞÜ][A-Za-zÀ-ÿçğıöşüÇĞİÖŞÜ'\-]*){0,2})\b",
+        blob,
+        flags=re.IGNORECASE,
+    )
+    if located:
+        candidate = located.group(1).strip()
+        if candidate.lower() not in ACTIVITY_ANSWER_CUES:
+            return _extract_city_from_text(candidate) or candidate.title()
+    from_alias = re.search(
+        r"\bfrom\s+([A-Za-zÀ-ÿçğıöşüÇĞİÖŞÜ][A-Za-zÀ-ÿçğıöşüÇĞİÖŞÜ'\-]*)\b",
+        blob,
+        flags=re.IGNORECASE,
+    )
+    if from_alias:
+        aliased = _extract_city_from_text(from_alias.group(1))
+        if aliased:
+            return aliased
+    if not _assistant_asked_for_city(state):
+        return ""
+    words = re.findall(r"[A-Za-zÀ-ÿçğıöşüÇĞİÖŞÜ]+", blob)
+    if 1 <= len(words) <= 3:
+        joined = " ".join(words)
+        if not any(cue in joined.lower() for cue in ACTIVITY_ANSWER_CUES):
+            return _extract_city_from_text(joined) or joined.title()
+    return ""
+
+
 def _extract_city(state: State) -> str:
-    latest = _extract_city_from_text(_latest_user_text(state))
-    if latest:
-        return latest
-    from_history = _extract_city_from_text(_user_conversation_text(state))
-    if from_history:
-        return from_history
-    return (state.get("city") or "").strip()
+    latest = _latest_user_text(state)
+    found = _extract_city_from_text(latest) or _city_from_short_reply(latest, state)
+    if found:
+        return found
+    stored = (state.get("city") or "").strip()
+    if stored:
+        return stored
+    return _extract_city_from_text(_user_conversation_text(state))
+
+
+def _city_missing_reply() -> dict[str, Any]:
+    return {"messages": [AIMessage(content=CITY_ASK_PROMPT)]}
 
 
 def _extract_activity_preference(state: State) -> str:
@@ -872,7 +936,9 @@ def _wants_live_cinema(state: State) -> bool:
 
 
 def _live_cinema_query(city: str) -> str:
-    city_q = (city or "Istanbul").strip() or "Istanbul"
+    city_q = (city or "").strip()
+    if not city_q:
+        return ""
     if city_q.lower() in {"istanbul", "i̇stanbul"}:
         return ISTANBUL_LIVE_CINEMA_QUERY
     return (
@@ -882,7 +948,7 @@ def _live_cinema_query(city: str) -> str:
 
 
 def _city_search_labels(city: str) -> tuple[str, str]:
-    city_en = (city or "Istanbul").strip() or "Istanbul"
+    city_en = (city or "").strip()
     city_tr = "İstanbul" if city_en.lower() in {"istanbul", "i̇stanbul"} else city_en
     return city_en, city_tr
 
@@ -912,11 +978,13 @@ def _live_queries_for_category(city: str, category: str) -> list[str]:
             f"{city_tr} art exhibitions galleries this month 2026 Istanbul Modern Pera Museum",
         ],
     }
-    return list(templates.get(category, []))
+    return [query for query in templates.get(category, []) if query]
 
 
 def _preference_search_queries(city: str, preference: str) -> list[str]:
-    city_q = city or "Istanbul"
+    city_q = (city or "").strip()
+    if not city_q:
+        return []
     pref = (preference or "screen-free activities").strip()
     queries = [
         f"{city_q} {pref} this weekend live events venues 2026",
@@ -940,7 +1008,7 @@ def _preference_search_queries(city: str, preference: str) -> list[str]:
     seen: set[str] = set()
     unique: list[str] = []
     for query in queries:
-        if query in seen:
+        if not query or query in seen:
             continue
         seen.add(query)
         unique.append(query)
@@ -948,7 +1016,9 @@ def _preference_search_queries(city: str, preference: str) -> list[str]:
 
 
 def _build_live_search_queries(state: State) -> list[str]:
-    city = _extract_city(state) or "Istanbul"
+    city = _extract_city(state)
+    if not city:
+        return []
     queries: list[str] = []
     categories = _detect_live_event_categories(state) or ["concerts"]
     for category in categories:
@@ -956,7 +1026,7 @@ def _build_live_search_queries(state: State) -> list[str]:
     seen: set[str] = set()
     unique: list[str] = []
     for query in queries:
-        if query in seen:
+        if not query or query in seen:
             continue
         seen.add(query)
         unique.append(query)
@@ -1016,7 +1086,9 @@ def _run_preference_searches(state: State) -> tuple[str, bool, list[str]]:
 
 
 def _run_lifestyle_spot_searches(state: State) -> tuple[str, bool, list[str]]:
-    city = _extract_city(state) or "Istanbul"
+    city = _extract_city(state)
+    if not city:
+        return "", False, []
     blob = _event_search_blob(state)
     queries: list[str] = []
     if any(cue in blob for cue in HOME_READING_CUES + ("cafe", "kafe", "coffee")):
@@ -1194,23 +1266,20 @@ def screen_time_node(state: State) -> dict[str, list[BaseMessage]]:
 def activity_preference_node(state: State) -> dict[str, Any]:
     """Read the latest user reply for city/setting, then unlock event search."""
     latest = _latest_user_text(state)
-    city = (
-        _extract_city_from_text(latest)
-        or (state.get("city") or "").strip()
-        or _extract_city(state)
-    )
+    city = _extract_city(state)
     preference = (
         _extract_preference_from_text(latest, allow_freeform=True)
         or (state.get("activity_preference") or "").strip()
         or _extract_activity_preference(state)
     )
+    payload: dict[str, Any] = {
+        "activity_preference": preference,
+        "preference_ready": bool(preference),
+    }
+    if city:
+        payload["city"] = city
     if preference:
-        city = city or "Istanbul"
-        return {
-            "city": city,
-            "activity_preference": preference,
-            "preference_ready": True,
-        }
+        return payload
 
     last = state.get("messages", [])[-1] if state.get("messages") else None
     last_text = _message_text(last).lower() if last is not None else ""
@@ -1219,6 +1288,8 @@ def activity_preference_node(state: State) -> dict[str, Any]:
         and _is_ai(last)
         and (
             "which city are you located" in last_text
+            or "which city are you currently in" in last_text
+            or "best local options for you" in last_text
             or "to make the most of your offline time" in last_text
             or "hangi şehirdesiniz" in last_text
             or "ekran süreniz dışındaki" in last_text
@@ -1228,18 +1299,10 @@ def activity_preference_node(state: State) -> dict[str, Any]:
         )
     )
     if already_asked:
-        return {
-            "city": city,
-            "activity_preference": preference,
-            "preference_ready": False,
-        }
+        return payload
 
-    return {
-        "city": city,
-        "activity_preference": preference,
-        "preference_ready": False,
-        "messages": [AIMessage(content=PREFERENCE_PROMPT)],
-    }
+    payload["messages"] = [AIMessage(content=PREFERENCE_PROMPT)]
+    return payload
 
 
 def route_after_preference(
@@ -1276,9 +1339,11 @@ def _chat_for_activity_nodes(state: State) -> list[Any]:
     return trimmed[-8:]
 
 
-def live_events_node(state: State) -> dict[str, list[BaseMessage]]:
+def live_events_node(state: State) -> dict[str, Any]:
     """Live Tavily listings for movies, concerts, theater, matches, festivals, exhibitions."""
-    city = _extract_city(state) or (state.get("city") or "").strip() or "Istanbul"
+    city = _extract_city(state)
+    if not city:
+        return _city_missing_reply()
     preference = (
         _extract_activity_preference(state)
         or _extract_preference_from_text(_latest_user_text(state), allow_freeform=True)
@@ -1295,14 +1360,10 @@ def live_events_node(state: State) -> dict[str, list[BaseMessage]]:
         "**Detox Note:** ...\n"
         "Skip any field that is not explicitly present in the Tavily payload."
     )
-    verified = (
-        "Atlas 1948, Kadıköy Sineması, Paribu Cineverse, Zorlu PSM, DasDas, "
-        "Harbiye Open Air, Parkorman, Istanbul Modern, Pera Museum"
-    )
     fallback = (
         f"Search is missing live schedules. Do not invent titles or dates. "
-        f"Point the user to verified spots in {city}: {verified}. "
-        "Invite them to check those venues' current programs."
+        f"Point the user to official ticketing sites and current programs at "
+        f"well-known venues in {city}."
     )
 
     prompt_messages: list[BaseMessage] = [
@@ -1334,12 +1395,14 @@ def live_events_node(state: State) -> dict[str, list[BaseMessage]]:
         prompt_messages.append(SystemMessage(content=fallback))
     prompt_messages.extend(_chat_for_activity_nodes(state))
     response = llm.invoke(_messages_for_gemini(prompt_messages))
-    return {"messages": [response]}
+    return {"messages": [response], "city": city}
 
 
-def lifestyle_recommendation_node(state: State) -> dict[str, list[BaseMessage]]:
+def lifestyle_recommendation_node(state: State) -> dict[str, Any]:
     """LLM-first books, recipes, crafts, workouts, and quiet parks."""
-    city = _extract_city(state) or (state.get("city") or "").strip() or "Istanbul"
+    city = _extract_city(state)
+    if not city:
+        return _city_missing_reply()
     preference = (
         _extract_activity_preference(state)
         or _extract_preference_from_text(_latest_user_text(state), allow_freeform=True)
@@ -1377,7 +1440,7 @@ def lifestyle_recommendation_node(state: State) -> dict[str, list[BaseMessage]]:
         )
     prompt_messages.extend(_chat_for_activity_nodes(state))
     response = llm.invoke(_messages_for_gemini(prompt_messages))
-    return {"messages": [response]}
+    return {"messages": [response], "city": city}
 
 
 def build_graph():
@@ -1461,15 +1524,27 @@ def _last_assistant_text(result: State) -> str:
     return ""
 
 
+def last_assistant_reply(result: State) -> str:
+    return _last_assistant_text(result)
+
+
+def invoke_graph_state(
+    user_message: HumanMessage,
+    history: list | None = None,
+    **state_fields: Any,
+) -> State:
+    messages = list(history or [])
+    messages.append(user_message)
+    payload: dict[str, Any] = {"messages": messages, **state_fields}
+    return well_being_graph.invoke(payload)
+
+
 def invoke_graph(
     user_message: HumanMessage,
     history: list | None = None,
     **state_fields: Any,
 ) -> str:
-    messages = list(history or [])
-    messages.append(user_message)
-    payload: dict[str, Any] = {"messages": messages, **state_fields}
-    result = well_being_graph.invoke(payload)
+    result = invoke_graph_state(user_message, history=history, **state_fields)
     return _last_assistant_text(result)
 
 

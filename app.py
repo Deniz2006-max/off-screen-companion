@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import streamlit as st
-from ai_engine import analyze_screen_time, get_event_recommendations, invoke_graph
+from ai_engine import (
+    analyze_screen_time,
+    get_event_recommendations,
+    invoke_graph_state,
+    last_assistant_reply,
+)
 from langchain_core.messages import AIMessage, HumanMessage
 
 st.set_page_config(
@@ -238,7 +243,7 @@ def render_chat() -> None:
 
     history = _graph_history()[:-1]
     with st.spinner("Thinking..."):
-        reply = invoke_graph(
+        result = invoke_graph_state(
             HumanMessage(content=prompt),
             history=history,
             has_analyzed=bool(
@@ -247,6 +252,10 @@ def render_chat() -> None:
             city=st.session_state.city or "",
             activity_preference=st.session_state.hobbies or "",
         )
+        city = (result.get("city") or "").strip()
+        if city:
+            st.session_state.city = city
+        reply = last_assistant_reply(result)
     append_assistant_once(reply)
     with st.chat_message("assistant"):
         st.markdown(reply)
