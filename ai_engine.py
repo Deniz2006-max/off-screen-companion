@@ -88,15 +88,19 @@ Role: You are a hybrid local-activity guide for digital well-being: live Tavily 
 Always reply in English.
 
 Hybrid method:
-1. Ground names, venues, dates, and events in the Tavily search context or widely recognized real-world places.
-2. Follow the user's exact preference — museums, theater, coffee shops, workshops, walks, reading, cinema, or anything else they named — do not collapse them into a rigid indoor/outdoor menu.
-3. Use LLM intelligence to explain why each idea is a good, engaging screen-free swap for this person, this city, and this weekend/today.
-4. Support multi-turn follow-ups: if they ask more about a recommendation, stay on that thread. Search again when they want fresh listings.
-5. Do NOT repeat or regenerate the earlier screen-time analysis. Reply only with activity recommendations.
+1. Run from the Tavily search payload first. Ground artist names, event titles, dates, times, and venues in that payload.
+2. Cover the user's category dynamically: cinema, concerts, music festivals, theater, stand-up, art exhibitions, outdoor workshops, or whatever they named.
+3. For each recommendation, write a short structured card:
+   - Artist / Event Name
+   - Exact Date & Time (only if present in Tavily; otherwise say the listing did not include a time)
+   - Venue / Location (e.g. Harbiye Open Air, Zorlu PSM, Parkorman)
+   - Digital detox note: one sentence on why this live event is a strong screen-free swap
+4. Do NOT repeat or regenerate the earlier screen-time analysis.
 
 If search results are ambiguous or lack a specific live schedule:
 - Do NEVER invent fake event names, fictional dates, or made-up venue locations.
-- Recommend well-known, verified local venues that match the requested activity and suggest checking their current schedules.
+- Recommend ONLY items that appear in the Tavily search payload. Do not use memory for current listings.
+- If a date, time, or venue is missing in Tavily, omit that field rather than guessing.
 
 Keep the tone encouraging and non-judgmental. Invite another follow-up at the end.
 """
@@ -670,6 +674,10 @@ def _latest_focus_category(state: State) -> str:
         return "workshop"
     if any(cue in latest for cue in ("cinema", "movie", "film", "sinema", "vizyon")):
         return "cinema"
+    if any(cue in latest for cue in ("stand-up", "standup", "stand up", "comedy", "komedi")):
+        return "standup"
+    if any(cue in latest for cue in ("festival", "festivali", "parkorman")):
+        return "festivals"
     if any(cue in latest for cue in ("concert", "konser")):
         return "concerts"
     if any(cue in latest for cue in ("tiyatro", "theater", "theatre", "play", "psm", "dasdas")):
@@ -678,6 +686,159 @@ def _latest_focus_category(state: State) -> str:
         return "outdoor"
     preference = _extract_activity_preference(state)
     return preference or "offline activities"
+
+
+ISTANBUL_LIVE_CINEMA_QUERY = (
+    "current movies in cinemas Istanbul August 2026 showtimes biletinial paribu cineverse"
+)
+CINEMA_LIVE_CUES = (
+    "cinema",
+    "movie",
+    "movies",
+    "film",
+    "films",
+    "sinema",
+    "vizyon",
+    "showtimes",
+    "biletinial",
+    "cineverse",
+    "paribu",
+)
+LIVE_EVENT_CATEGORY_CUES: dict[str, tuple[str, ...]] = {
+    "cinema": CINEMA_LIVE_CUES,
+    "concerts": (
+        "concert",
+        "konser",
+        "live music",
+        "biletix",
+        "passo",
+        "harbiye",
+        "artist",
+    ),
+    "festivals": (
+        "festival",
+        "festivali",
+        "music festival",
+        "parkorman",
+        "open air festival",
+    ),
+    "theater": (
+        "theater",
+        "theatre",
+        "tiyatro",
+        "play",
+        "psm",
+        "dasdas",
+        "zorlu",
+    ),
+    "standup": (
+        "stand-up",
+        "standup",
+        "stand up",
+        "comedy",
+        "komedi",
+    ),
+    "exhibitions": (
+        "exhibition",
+        "sergi",
+        "gallery",
+        "art show",
+        "müze",
+        "muze",
+        "museum",
+    ),
+    "workshops": (
+        "workshop",
+        "workshops",
+        "atölye",
+        "atolye",
+        "outdoor workshop",
+    ),
+}
+
+
+def _event_search_blob(state: State) -> str:
+    return " ".join(
+        (
+            _latest_user_text(state),
+            _extract_activity_preference(state),
+            (state.get("activity_preference") or ""),
+        )
+    ).lower()
+
+
+def _detect_live_event_categories(state: State) -> list[str]:
+    blob = _event_search_blob(state)
+    matched = [
+        category
+        for category, cues in LIVE_EVENT_CATEGORY_CUES.items()
+        if any(cue in blob for cue in cues)
+    ]
+    if matched:
+        return matched
+    focus = _latest_focus_category(state)
+    focus_map = {
+        "cinema": "cinema",
+        "concerts": "concerts",
+        "theater": "theater",
+        "museum": "exhibitions",
+        "workshop": "workshops",
+        "outdoor": "festivals",
+    }
+    if focus in focus_map:
+        return [focus_map[focus]]
+    if any(cue in blob for cue in ("event", "etkinlik", "tonight", "this weekend")):
+        return ["concerts", "theater", "exhibitions"]
+    return []
+
+
+def _wants_live_cinema(state: State) -> bool:
+    return "cinema" in _detect_live_event_categories(state) or _latest_focus_category(
+        state
+    ) == "cinema"
+
+
+def _live_cinema_query(city: str) -> str:
+    city_q = (city or "Istanbul").strip() or "Istanbul"
+    if city_q.lower() in {"istanbul", "i̇stanbul"}:
+        return ISTANBUL_LIVE_CINEMA_QUERY
+    return (
+        f"current movies in cinemas {city_q} August 2026 showtimes "
+        "biletinial paribu cineverse"
+    )
+
+
+def _city_search_labels(city: str) -> tuple[str, str]:
+    city_en = (city or "Istanbul").strip() or "Istanbul"
+    city_tr = "İstanbul" if city_en.lower() in {"istanbul", "i̇stanbul"} else city_en
+    return city_en, city_tr
+
+
+def _live_queries_for_category(city: str, category: str) -> list[str]:
+    city_en, city_tr = _city_search_labels(city)
+    templates = {
+        "cinema": [_live_cinema_query(city_en)],
+        "concerts": [
+            f"{city_tr} upcoming concerts 2026 famous artists dates venues Biletix Passo",
+            f"{city_en} live concerts this weekend August 2026 Harbiye Parkorman",
+        ],
+        "festivals": [
+            f"{city_tr} music festivals 2026 dates venues Parkorman Biletix Passo",
+        ],
+        "theater": [
+            f"{city_tr} theater plays this month 2026 Zorlu PSM DasDas Biletix dates",
+        ],
+        "standup": [
+            f"{city_en} stand-up comedy shows August 2026 dates venues Biletix",
+        ],
+        "exhibitions": [
+            f"{city_tr} art exhibitions galleries this month 2026 Istanbul Modern Pera Museum",
+        ],
+        "workshops": [
+            f"{city_en} outdoor workshops classes this weekend August 2026",
+        ],
+    }
+    return list(templates.get(category, []))
 
 
 def _preference_search_queries(city: str, preference: str) -> list[str]:
@@ -700,9 +861,8 @@ def _preference_search_queries(city: str, preference: str) -> list[str]:
         queries.append(f"{city_q} theater plays this week")
     if any(cue in lower for cue in ("kitap", "read", "book", "reading")):
         queries.append(f"{city_q} book cafes quiet reading spots")
-    if any(cue in lower for cue in ("cinema", "sinema", "film", "movie")):
-        queries.append(f"{city_q} current popular movies in cinemas")
-    # Deduplicate while preserving order
+    if any(cue in lower for cue in CINEMA_LIVE_CUES):
+        queries.append(_live_cinema_query(city_q))
     seen: set[str] = set()
     unique: list[str] = []
     for query in queries:
@@ -711,6 +871,27 @@ def _preference_search_queries(city: str, preference: str) -> list[str]:
         seen.add(query)
         unique.append(query)
     return unique[:4]
+
+
+def _build_live_search_queries(state: State) -> list[str]:
+    city = _extract_city(state) or "Istanbul"
+    preference = (
+        _extract_activity_preference(state)
+        or _latest_user_text(state)
+        or "screen-free activities"
+    )
+    queries: list[str] = []
+    for category in _detect_live_event_categories(state):
+        queries.extend(_live_queries_for_category(city, category))
+    queries.extend(_preference_search_queries(city, preference))
+    seen: set[str] = set()
+    unique: list[str] = []
+    for query in queries:
+        if query in seen:
+            continue
+        seen.add(query)
+        unique.append(query)
+    return unique[:5]
 
 
 def _clean_tavily_results(raw: Any) -> str:
@@ -745,21 +926,23 @@ def _run_tavily_query(search_query: str) -> str:
 
 
 def _run_preference_searches(state: State) -> tuple[str, bool, list[str]]:
-    city = _extract_city(state) or "Istanbul"
     preference = (
         _extract_activity_preference(state)
         or _latest_user_text(state)
         or "screen-free activities"
     )
-    queries = _preference_search_queries(city, preference)
+    queries = _build_live_search_queries(state)
+    live_categories = _detect_live_event_categories(state)
     chunks: list[str] = []
     any_hits = False
-    for search_query in queries:
+    for index, search_query in enumerate(queries):
         result = _run_tavily_query(search_query)
         if not result:
             continue
         any_hits = True
-        chunks.append(f"[{preference}] {search_query}\n{result[:1500]}")
+        limit = 4000 if index == 0 and live_categories else 1800
+        label = ",".join(live_categories) or preference
+        chunks.append(f"[{label}] {search_query}\n{result[:limit]}")
     return "\n\n".join(chunks), any_hits, queries
 
 
@@ -1008,6 +1191,16 @@ def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
     )
     focus = _latest_focus_category(state)
     live_results, has_live_data, queries = _run_preference_searches(state)
+    live_categories = _detect_live_event_categories(state)
+    structured_output = (
+        "For each live event, use this exact markdown structure drawn ONLY from Tavily:\n"
+        "**Artist / Event Name:** ...\n"
+        "**Date & Time:** ...\n"
+        "**Venue / Location:** ...\n"
+        "**Digital detox note:** ...\n"
+        "Skip any field that is not explicitly present in the Tavily payload. "
+        "Do not invent artists, titles, dates, or venues."
+    )
     classics = "; ".join(CLASSIC_HISTORICAL_NOVELS)
     verified = (
         "Atlas 1948, Kadıköy Sineması, Paribu Cineverse, Zorlu PSM, DasDas, "
@@ -1032,23 +1225,33 @@ def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
             content=(
                 f"Always reply in English. City: {city}. "
                 f"User preference (use this exactly): {preference}. "
+                f"Live event categories: {', '.join(live_categories) or 'general'}. "
                 f"Tavily queries used: {'; '.join(queries)}. {isolation} "
+                f"{structured_output} "
                 "HYBRID: ground names/dates/venues in Tavily results, then add "
-                "personalized, engaging reasons these are good screen-free plans. "
+                "personalized digital-detox reasons. "
                 "Do NOT repeat the screen-time analysis or the preference question. "
                 "Return only fresh real-world recommendations for this turn. "
-                "Never invent titles or dates that are not in search or widely known. "
+                "You MUST recommend only events, movies, artists, dates, and venues "
+                "that appear in the Tavily search payload. Never invent or recall "
+                "listings from memory. If a detail is not written in Tavily, omit it. "
                 "Invite another follow-up at the end."
             )
         ),
     ]
     if has_live_data:
+        cinema_rule = (
+            "STRICT GROUNDING: Recommend only movies, concerts, festivals, plays, "
+            "stand-up shows, exhibitions, or workshops named in this Tavily payload. "
+            "Do not add titles from memory or older knowledge.\n\n"
+        )
         prompt_messages.append(
             SystemMessage(
                 content=(
                     "Live Tavily search results. Use only names clearly present here. "
+                    f"{cinema_rule}"
                     "If a title, date, play, or venue is not explicit, omit it and "
-                    f"fall back to verified spots ({verified}).\n\n{live_results[:6000]}"
+                    f"fall back to verified spots ({verified}).\n\n{live_results[:8000]}"
                 )
             )
         )
