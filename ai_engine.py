@@ -83,24 +83,35 @@ Ethical Constraints & Guardrails:
 - Privacy First: Do not request or store sensitive personal health data.
 """
 
-EVENT_RECOMMENDATIONS_SYSTEM_PROMPT = """
-Role: You are a hybrid local-activity guide for digital well-being: live Tavily facts plus creative, personalized reasoning.
-Always reply in English.
+LIVE_EVENTS_SYSTEM_PROMPT = """
+Role: You are a live-events guide for digital well-being. Always reply in English.
 
-Hybrid method:
-1. Run from the Tavily search payload first. Ground artist names, event titles, dates, times, and venues in that payload.
-2. Cover the user's category dynamically: cinema, concerts, music festivals, theater, stand-up, art exhibitions, outdoor workshops, or whatever they named.
-3. For each recommendation, write a short structured card:
-   - Artist / Event Name
-   - Exact Date & Time (only if present in Tavily; otherwise say the listing did not include a time)
-   - Venue / Location (e.g. Harbiye Open Air, Zorlu PSM, Parkorman)
-   - Digital detox note: one sentence on why this live event is a strong screen-free swap
-4. Do NOT repeat or regenerate the earlier screen-time analysis.
+You recommend real-time public events: movies, concerts, theater, sports matches, festivals, and exhibitions.
 
-If search results are ambiguous or lack a specific live schedule:
-- Do NEVER invent fake event names, fictional dates, or made-up venue locations.
-- Recommend ONLY items that appear in the Tavily search payload. Do not use memory for current listings.
-- If a date, time, or venue is missing in Tavily, omit that field rather than guessing.
+Method:
+1. Use the Tavily search payload first. Ground event names, dates, times, and venues in that payload.
+2. For each recommendation, use this markdown structure:
+   - **Event Name:** ...
+   - **Date & Time:** ... (only if present in Tavily)
+   - **Venue:** ... (e.g. Harbiye Open Air, Zorlu PSM, Parkorman)
+   - **Detox Note:** one sentence on why this live outing is a strong screen-free swap
+3. Do NOT repeat the earlier screen-time analysis.
+4. Do NEVER invent fake event names, dates, or venues. If a field is missing in Tavily, omit it.
+
+Keep the tone encouraging. Invite another follow-up at the end.
+"""
+
+LIFESTYLE_RECOMMENDATION_SYSTEM_PROMPT = """
+Role: You are a warm digital-detox lifestyle coach. Always reply in English.
+
+You recommend personal, mostly at-home or quiet offline resets: books, cooking/recipes, crafts, DIY hobbies, home workouts, and quiet parks.
+
+Method:
+1. Rely primarily on your knowledge for rich, specific content (book titles with authors and short synopses, simple recipes, craft project ideas, short home workouts).
+2. Write in a natural, engaging voice. Do NOT use rigid Event Name / Date / Venue cards.
+3. If quiet reading spots or parks are relevant and local search notes are provided, you may mention real places from those notes.
+4. Do NOT repeat the earlier screen-time analysis.
+5. Do not invent live concert/movie showtimes; send the user to live-event help if they want tickets and dates.
 
 Keep the tone encouraging and non-judgmental. Invite another follow-up at the end.
 """
@@ -680,6 +691,8 @@ def _latest_focus_category(state: State) -> str:
         return "festivals"
     if any(cue in latest for cue in ("concert", "konser")):
         return "concerts"
+    if any(cue in latest for cue in ("match", "maç", "football", "soccer", "basketball")):
+        return "matches"
     if any(cue in latest for cue in ("tiyatro", "theater", "theatre", "play", "psm", "dasdas")):
         return "theater"
     if any(cue in latest for cue in ("hike", "hiking", "park", "walk", "doğa", "orman", "forest", "yürüyüş")):
@@ -731,6 +744,19 @@ LIVE_EVENT_CATEGORY_CUES: dict[str, tuple[str, ...]] = {
         "dasdas",
         "zorlu",
     ),
+    "matches": (
+        "match",
+        "matches",
+        "maç",
+        "mac ",
+        "football",
+        "soccer",
+        "basketball",
+        "super lig",
+        "süper lig",
+        "stadium",
+        "stadyum",
+    ),
     "standup": (
         "stand-up",
         "standup",
@@ -747,14 +773,41 @@ LIVE_EVENT_CATEGORY_CUES: dict[str, tuple[str, ...]] = {
         "muze",
         "museum",
     ),
-    "workshops": (
-        "workshop",
-        "workshops",
-        "atölye",
-        "atolye",
-        "outdoor workshop",
-    ),
 }
+LIFESTYLE_CUES = (
+    "book",
+    "books",
+    "novel",
+    "novels",
+    "reading",
+    "kitap",
+    "recipe",
+    "recipes",
+    "cook",
+    "cooking",
+    "yemek",
+    "craft",
+    "crafts",
+    "diy",
+    "hobby",
+    "hobbies",
+    "journal",
+    "journaling",
+    "workout",
+    "yoga",
+    "home workout",
+    "quiet park",
+    "parks",
+    "park",
+    "walk",
+    "at home",
+    "stay home",
+    "evde",
+    "reset",
+    "workshop",
+    "atölye",
+    "atolye",
+)
 
 
 def _event_search_blob(state: State) -> str:
@@ -775,21 +828,41 @@ def _detect_live_event_categories(state: State) -> list[str]:
         if any(cue in blob for cue in cues)
     ]
     if matched:
-        return matched
+        return [category for category in matched if category != "workshops"]
     focus = _latest_focus_category(state)
     focus_map = {
         "cinema": "cinema",
         "concerts": "concerts",
         "theater": "theater",
         "museum": "exhibitions",
-        "workshop": "workshops",
-        "outdoor": "festivals",
+        "festivals": "festivals",
+        "standup": "standup",
+        "matches": "matches",
     }
     if focus in focus_map:
         return [focus_map[focus]]
-    if any(cue in blob for cue in ("event", "etkinlik", "tonight", "this weekend")):
+    if any(cue in blob for cue in ("showtimes", "tickets", "biletix", "passo", "etkinlik")):
         return ["concerts", "theater", "exhibitions"]
     return []
+
+
+def _wants_live_events(state: State) -> bool:
+    return bool(_detect_live_event_categories(state))
+
+
+def _wants_lifestyle(state: State) -> bool:
+    blob = _event_search_blob(state)
+    if _wants_live_events(state):
+        return False
+    return any(cue in blob for cue in LIFESTYLE_CUES) or bool(
+        _extract_preference_from_text(_latest_user_text(state), allow_freeform=True)
+    )
+
+
+def _activity_route(state: State) -> Literal["live_events_node", "lifestyle_recommendation_node"]:
+    if _wants_live_events(state):
+        return "live_events_node"
+    return "lifestyle_recommendation_node"
 
 
 def _wants_live_cinema(state: State) -> bool:
@@ -828,14 +901,15 @@ def _live_queries_for_category(city: str, category: str) -> list[str]:
         "theater": [
             f"{city_tr} theater plays this month 2026 Zorlu PSM DasDas Biletix dates",
         ],
+        "matches": [
+            f"{city_tr} upcoming football basketball matches 2026 dates venues tickets",
+            f"{city_en} sports matches this weekend August 2026 stadium schedule",
+        ],
         "standup": [
             f"{city_en} stand-up comedy shows August 2026 dates venues Biletix",
         ],
         "exhibitions": [
             f"{city_tr} art exhibitions galleries this month 2026 Istanbul Modern Pera Museum",
-        ],
-        "workshops": [
-            f"{city_en} outdoor workshops classes this weekend August 2026",
         ],
     }
     return list(templates.get(category, []))
@@ -875,15 +949,10 @@ def _preference_search_queries(city: str, preference: str) -> list[str]:
 
 def _build_live_search_queries(state: State) -> list[str]:
     city = _extract_city(state) or "Istanbul"
-    preference = (
-        _extract_activity_preference(state)
-        or _latest_user_text(state)
-        or "screen-free activities"
-    )
     queries: list[str] = []
-    for category in _detect_live_event_categories(state):
+    categories = _detect_live_event_categories(state) or ["concerts"]
+    for category in categories:
         queries.extend(_live_queries_for_category(city, category))
-    queries.extend(_preference_search_queries(city, preference))
     seen: set[str] = set()
     unique: list[str] = []
     for query in queries:
@@ -943,6 +1012,25 @@ def _run_preference_searches(state: State) -> tuple[str, bool, list[str]]:
         limit = 4000 if index == 0 and live_categories else 1800
         label = ",".join(live_categories) or preference
         chunks.append(f"[{label}] {search_query}\n{result[:limit]}")
+    return "\n\n".join(chunks), any_hits, queries
+
+
+def _run_lifestyle_spot_searches(state: State) -> tuple[str, bool, list[str]]:
+    city = _extract_city(state) or "Istanbul"
+    blob = _event_search_blob(state)
+    queries: list[str] = []
+    if any(cue in blob for cue in HOME_READING_CUES + ("cafe", "kafe", "coffee")):
+        queries.append(f"{city} quiet book cafes reading spots")
+    if any(cue in blob for cue in ("park", "walk", "nature", "quiet")):
+        queries.append(f"{city} quiet parks walking paths")
+    chunks: list[str] = []
+    any_hits = False
+    for search_query in queries[:2]:
+        result = _run_tavily_query(search_query)
+        if not result:
+            continue
+        any_hits = True
+        chunks.append(f"{search_query}\n{result[:1500]}")
     return "\n\n".join(chunks), any_hits, queries
 
 
@@ -1018,8 +1106,13 @@ def scope_check(state: State) -> Literal["reject_node", "task_router"]:
 
 def task_router(
     state: State,
-) -> Literal["screen_time_node", "activity_preference_node", "event_finder_node"]:
-    """After analysis, send text replies to events/preferences — never back to analysis."""
+) -> Literal[
+    "screen_time_node",
+    "activity_preference_node",
+    "live_events_node",
+    "lifestyle_recommendation_node",
+]:
+    """After analysis, send live shows to Tavily events and hobbies to lifestyle."""
     if _has_analyzed(state):
         latest = _latest_user_text(state).strip()
         wants_activity = bool(
@@ -1032,7 +1125,7 @@ def task_router(
             )
         )
         if wants_activity:
-            return "event_finder_node"
+            return _activity_route(state)
         return "activity_preference_node"
 
     missing_in_state = not (
@@ -1149,10 +1242,12 @@ def activity_preference_node(state: State) -> dict[str, Any]:
     }
 
 
-def route_after_preference(state: State) -> Literal["event_finder_node", "__end__"]:
-    if state.get("preference_ready"):
-        return "event_finder_node"
-    return END
+def route_after_preference(
+    state: State,
+) -> Literal["live_events_node", "lifestyle_recommendation_node", "__end__"]:
+    if not state.get("preference_ready"):
+        return END
+    return _activity_route(state)
 
 
 def _looks_like_analysis_message(message: Any) -> bool:
@@ -1165,8 +1260,8 @@ def _looks_like_analysis_message(message: Any) -> bool:
     )
 
 
-def _chat_for_event_finder(state: State) -> list[Any]:
-    """Pass recent text only so event search does not replay the analysis."""
+def _chat_for_activity_nodes(state: State) -> list[Any]:
+    """Pass recent text only so later nodes do not replay the analysis."""
     trimmed: list[Any] = []
     for message in state.get("messages", []):
         if _is_ai(message) and _looks_like_analysis_message(message):
@@ -1181,83 +1276,106 @@ def _chat_for_event_finder(state: State) -> list[Any]:
     return trimmed[-8:]
 
 
-def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
+def live_events_node(state: State) -> dict[str, list[BaseMessage]]:
+    """Live Tavily listings for movies, concerts, theater, matches, festivals, exhibitions."""
     city = _extract_city(state) or (state.get("city") or "").strip() or "Istanbul"
     preference = (
         _extract_activity_preference(state)
         or _extract_preference_from_text(_latest_user_text(state), allow_freeform=True)
         or _latest_user_text(state)
-        or "screen-free activities"
+        or "live events"
     )
-    focus = _latest_focus_category(state)
     live_results, has_live_data, queries = _run_preference_searches(state)
-    live_categories = _detect_live_event_categories(state)
+    live_categories = _detect_live_event_categories(state) or ["concerts"]
     structured_output = (
         "For each live event, use this exact markdown structure drawn ONLY from Tavily:\n"
-        "**Artist / Event Name:** ...\n"
+        "**Event Name:** ...\n"
         "**Date & Time:** ...\n"
-        "**Venue / Location:** ...\n"
-        "**Digital detox note:** ...\n"
-        "Skip any field that is not explicitly present in the Tavily payload. "
-        "Do not invent artists, titles, dates, or venues."
+        "**Venue:** ...\n"
+        "**Detox Note:** ...\n"
+        "Skip any field that is not explicitly present in the Tavily payload."
     )
-    classics = "; ".join(CLASSIC_HISTORICAL_NOVELS)
     verified = (
         "Atlas 1948, Kadıköy Sineması, Paribu Cineverse, Zorlu PSM, DasDas, "
-        "Belgrat Ormanı, Atatürk Kent Ormanı, Istanbul Modern, Pera Museum, "
-        "and well-known book cafes or specialty coffee shops in the city"
-    )
-    isolation = (
-        f"The user asked for: {preference} (focus hint: {focus}). "
-        "Recommend ONLY real venues/events that match this specific interest "
-        "in their city. Do not force an indoor/outdoor binary or unrelated categories."
+        "Harbiye Open Air, Parkorman, Istanbul Modern, Pera Museum"
     )
     fallback = (
         f"Search is missing live schedules. Do not invent titles or dates. "
-        f"Point the user to verified spots in {city} that fit '{preference}': {verified}. "
-        "Invite them to check those venues' current programs. "
-        f"If they asked for books, you may name these classics only: {classics}."
+        f"Point the user to verified spots in {city}: {verified}. "
+        "Invite them to check those venues' current programs."
     )
 
     prompt_messages: list[BaseMessage] = [
-        SystemMessage(content=EVENT_RECOMMENDATIONS_SYSTEM_PROMPT),
+        SystemMessage(content=LIVE_EVENTS_SYSTEM_PROMPT),
         SystemMessage(
             content=(
                 f"Always reply in English. City: {city}. "
-                f"User preference (use this exactly): {preference}. "
-                f"Live event categories: {', '.join(live_categories) or 'general'}. "
-                f"Tavily queries used: {'; '.join(queries)}. {isolation} "
+                f"User asked for: {preference}. "
+                f"Live event categories: {', '.join(live_categories)}. "
+                f"Tavily queries: {'; '.join(queries)}. "
                 f"{structured_output} "
-                "HYBRID: ground names/dates/venues in Tavily results, then add "
-                "personalized digital-detox reasons. "
-                "Do NOT repeat the screen-time analysis or the preference question. "
-                "Return only fresh real-world recommendations for this turn. "
-                "You MUST recommend only events, movies, artists, dates, and venues "
-                "that appear in the Tavily search payload. Never invent or recall "
-                "listings from memory. If a detail is not written in Tavily, omit it. "
-                "Invite another follow-up at the end."
+                "Recommend only events, movies, artists, dates, and venues that "
+                "appear in the Tavily payload. Never invent listings. "
+                "Do NOT use Event cards for books, recipes, or home hobbies."
             )
         ),
     ]
     if has_live_data:
-        cinema_rule = (
-            "STRICT GROUNDING: Recommend only movies, concerts, festivals, plays, "
-            "stand-up shows, exhibitions, or workshops named in this Tavily payload. "
-            "Do not add titles from memory or older knowledge.\n\n"
-        )
         prompt_messages.append(
             SystemMessage(
                 content=(
                     "Live Tavily search results. Use only names clearly present here. "
-                    f"{cinema_rule}"
-                    "If a title, date, play, or venue is not explicit, omit it and "
-                    f"fall back to verified spots ({verified}).\n\n{live_results[:8000]}"
+                    "STRICT GROUNDING: no titles from memory.\n\n"
+                    f"{live_results[:8000]}"
                 )
             )
         )
     else:
         prompt_messages.append(SystemMessage(content=fallback))
-    prompt_messages.extend(_chat_for_event_finder(state))
+    prompt_messages.extend(_chat_for_activity_nodes(state))
+    response = llm.invoke(_messages_for_gemini(prompt_messages))
+    return {"messages": [response]}
+
+
+def lifestyle_recommendation_node(state: State) -> dict[str, list[BaseMessage]]:
+    """LLM-first books, recipes, crafts, workouts, and quiet parks."""
+    city = _extract_city(state) or (state.get("city") or "").strip() or "Istanbul"
+    preference = (
+        _extract_activity_preference(state)
+        or _extract_preference_from_text(_latest_user_text(state), allow_freeform=True)
+        or _latest_user_text(state)
+        or "a calm offline reset"
+    )
+    spot_results, has_spots, queries = _run_lifestyle_spot_searches(state)
+    classics = "; ".join(CLASSIC_HISTORICAL_NOVELS)
+
+    prompt_messages: list[BaseMessage] = [
+        SystemMessage(content=LIFESTYLE_RECOMMENDATION_SYSTEM_PROMPT),
+        SystemMessage(
+            content=(
+                f"Always reply in English. The user is in {city} and wants: {preference}. "
+                "Write natural, engaging advice — not Event/Date/Venue cards. "
+                "Offer specific books (title, author, short synopsis), recipes, "
+                "craft ideas, or a short home workout as fits their request. "
+                f"You may mention these well-known books if they asked for reading: {classics}. "
+                "Do not invent live concert or cinema showtimes."
+            )
+        ),
+    ]
+    if has_spots:
+        prompt_messages.append(
+            SystemMessage(
+                content=(
+                    "Optional local spot notes from Tavily. Mention a place only if "
+                    f"it clearly fits a quiet park or reading cafe.\n\n{spot_results[:4000]}"
+                )
+            )
+        )
+    elif queries:
+        prompt_messages.append(
+            SystemMessage(content=f"Local spot search ran but returned little: {queries}.")
+        )
+    prompt_messages.extend(_chat_for_activity_nodes(state))
     response = llm.invoke(_messages_for_gemini(prompt_messages))
     return {"messages": [response]}
 
@@ -1268,7 +1386,8 @@ def build_graph():
     workflow.add_node("reject_node", reject_node)
     workflow.add_node("screen_time_node", screen_time_node)
     workflow.add_node("activity_preference_node", activity_preference_node)
-    workflow.add_node("event_finder_node", event_finder_node)
+    workflow.add_node("live_events_node", live_events_node)
+    workflow.add_node("lifestyle_recommendation_node", lifestyle_recommendation_node)
 
     workflow.add_conditional_edges(
         START,
@@ -1284,7 +1403,8 @@ def build_graph():
         {
             "screen_time_node": "screen_time_node",
             "activity_preference_node": "activity_preference_node",
-            "event_finder_node": "event_finder_node",
+            "live_events_node": "live_events_node",
+            "lifestyle_recommendation_node": "lifestyle_recommendation_node",
         },
     )
     workflow.add_edge("screen_time_node", END)
@@ -1292,12 +1412,14 @@ def build_graph():
         "activity_preference_node",
         route_after_preference,
         {
-            "event_finder_node": "event_finder_node",
+            "live_events_node": "live_events_node",
+            "lifestyle_recommendation_node": "lifestyle_recommendation_node",
             END: END,
         },
     )
     workflow.add_edge("reject_node", END)
-    workflow.add_edge("event_finder_node", END)
+    workflow.add_edge("live_events_node", END)
+    workflow.add_edge("lifestyle_recommendation_node", END)
     return workflow.compile()
 
 
