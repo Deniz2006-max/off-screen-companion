@@ -105,13 +105,8 @@ def render_sidebar() -> None:
                 st.session_state.hobbies,
             )
             st.session_state.last_events = events
-            lines = ["Here are some offline ideas near you:"]
-            for event in events:
-                lines.append(
-                    f"- **{event['title']}** ({event['when']}, {event['city']}) — {event['why']}"
-                )
             st.session_state.messages.append(
-                {"role": "assistant", "content": "\n".join(lines)}
+                {"role": "assistant", "content": events}
             )
 
         if st.session_state.step == "dashboard":
@@ -180,10 +175,7 @@ def render_analysis_card() -> None:
         return
 
     st.subheader("Latest screen-time snapshot")
-    cols = st.columns(2)
-    cols[0].metric("Estimated hours", f"{analysis['total_hours']}")
-    cols[1].metric("Top app", analysis["top_apps"][0]["name"])
-    st.caption(analysis["insight"])
+    st.markdown(analysis)
 
 
 def render_chat() -> None:
@@ -203,10 +195,7 @@ def render_chat() -> None:
 
     analysis = st.session_state.last_analysis
     if analysis:
-        reply = (
-            f"{analysis['insight']} "
-            "If you want something local, set your city and hobbies in the sidebar."
-        )
+        reply = analysis
     else:
         reply = (
             "You haven't uploaded screen time data yet. "
