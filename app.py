@@ -12,6 +12,67 @@ st.set_page_config(
     layout="centered",
 )
 
+# Pastel renk temalarının CSS tanımlamaları
+THEMES = {
+    "Pastel Sage 🌿": {
+        "bg": "#EFEFE8",
+        "sidebar_bg": "#E2E4DA",
+        "primary": "#6B8E78",
+        "text": "#2C3E35"
+    },
+    "Pastel Rose 🌸": {
+        "bg": "#FDF0F0",
+        "sidebar_bg": "#F7E1E1",
+        "primary": "#D88A8A",
+        "text": "#4A2E2E"
+    },
+    "Pastel Ocean 🌊": {
+        "bg": "#EEF5F6",
+        "sidebar_bg": "#D6E6E8",
+        "primary": "#5C8D89",
+        "text": "#213537"
+    },
+    "Pastel Lavender 💜": {
+        "bg": "#F5F3F8",
+        "sidebar_bg": "#E8E2F0",
+        "primary": "#8E7CC3",
+        "text": "#312643"
+    },
+    "Pastel Sunset 🍊": {
+        "bg": "#FFF5EC",
+        "sidebar_bg": "#FFE5D4",
+        "primary": "#E07A5F",
+        "text": "#3D261D"
+    }
+}
+
+
+def apply_custom_theme(theme_name: str) -> None:
+    """Seçilen temayı CSS olarak sayfaya uygular."""
+    theme = THEMES.get(theme_name, THEMES["Pastel Sage 🌿"])
+    css = f"""
+        <style>
+        .stApp {{
+            background-color: {theme['bg']};
+            color: {theme['text']};
+        }}
+        [data-testid="stSidebar"] {{
+            background-color: {theme['sidebar_bg']};
+        }}
+        .stButton > button {{
+            background-color: {theme['primary']} !important;
+            color: white !important;
+            border: none !important;
+            border-radius: 12px !important;
+            font-weight: 500 !important;
+        }}
+        .stButton > button:hover {{
+            opacity: 0.9 !important;
+        }}
+        </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
 
 def init_session_state() -> None:
     defaults: dict[str, object] = {
@@ -20,6 +81,7 @@ def init_session_state() -> None:
         "last_events": None,
         "city": "",
         "hobbies": "",
+        "theme": "Pastel Sage 🌿",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -36,6 +98,9 @@ def render_sidebar() -> None:
             key="hobbies",
         )
 
+        st.markdown("---")
+        st.subheader("📊 Screen Time")
+
         image_file = st.file_uploader(
             "Upload a screen-time screenshot",
             type=["png", "jpg", "jpeg", "webp"],
@@ -48,7 +113,7 @@ def render_sidebar() -> None:
             key="usage_notes",
         )
 
-        if st.button("Analyze screen time", type="primary"):
+        if st.button("📊 Analyze Screen Time", type="primary", use_container_width=True):
             analysis = analyze_screen_time(image_file, notes)
             st.session_state.last_analysis = analysis
             st.session_state.messages.append(
@@ -62,7 +127,7 @@ def render_sidebar() -> None:
                 }
             )
 
-        if st.button("Suggest local events"):
+        if st.button("🎨 Suggest Local Events", use_container_width=True):
             events = get_event_recommendations(
                 st.session_state.city,
                 st.session_state.hobbies,
@@ -76,6 +141,14 @@ def render_sidebar() -> None:
             st.session_state.messages.append(
                 {"role": "assistant", "content": "\n".join(lines)}
             )
+
+        # Görseldekiyle birebir aynı yapı ve tasarımda Tema Seçici Dropdown
+        st.selectbox(
+            "Theme 🎨",
+            options=list(THEMES.keys()),
+            key="theme",
+            help="Select a pastel theme for the interface."
+        )
 
 
 def render_analysis_card() -> None:
@@ -124,6 +197,8 @@ def render_chat() -> None:
 
 def main() -> None:
     init_session_state()
+    apply_custom_theme(st.session_state.theme)
+    
     st.title("Digital well-being")
     st.write(
         "Upload a screen-time screenshot, chat about your habits, "
