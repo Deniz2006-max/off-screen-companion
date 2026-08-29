@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import streamlit as st
-
 from ai_engine import analyze_screen_time, get_event_recommendations
 
 st.set_page_config(
-    page_title="Digital Well-being",
+    page_title="Digital Well-Being",
     page_icon="🌿",
     layout="centered",
 )
 
-# Pastel renk temalarının CSS tanımlamaları
 THEMES = {
     "Pastel Sage 🌿": {
         "bg": "#EFEFE8",
@@ -76,6 +74,7 @@ def apply_custom_theme(theme_name: str) -> None:
 
 def init_session_state() -> None:
     defaults: dict[str, object] = {
+        "step": "onboarding",  # 'onboarding' veya 'dashboard'
         "messages": [],
         "last_analysis": None,
         "last_events": None,
@@ -99,33 +98,6 @@ def render_sidebar() -> None:
         )
 
         st.markdown("---")
-        st.subheader("📊 Screen Time")
-
-        image_file = st.file_uploader(
-            "Upload a screen-time screenshot",
-            type=["png", "jpg", "jpeg", "webp"],
-            help="Optional. A screenshot from your phone's screen-time report.",
-            key="screen_time_upload",
-        )
-        notes = st.text_area(
-            "Anything you noticed about your usage?",
-            placeholder="e.g. I was on Instagram a lot after 10pm…",
-            key="usage_notes",
-        )
-
-        if st.button("📊 Analyze Screen Time", type="primary", use_container_width=True):
-            analysis = analyze_screen_time(image_file, notes)
-            st.session_state.last_analysis = analysis
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "I looked at your screen time. "
-                        f"{analysis['insight']} "
-                        f"Try this: {analysis['suggestion']}"
-                    ),
-                }
-            )
 
         if st.button("🎨 Suggest Local Events", use_container_width=True):
             events = get_event_recommendations(
@@ -142,13 +114,64 @@ def render_sidebar() -> None:
                 {"role": "assistant", "content": "\n".join(lines)}
             )
 
-        # Görseldekiyle birebir aynı yapı ve tasarımda Tema Seçici Dropdown
+        if st.session_state.step == "dashboard":
+            if st.button("🔄 Restart / Upload New Screenshot", use_container_width=True):
+                st.session_state.step = "onboarding"
+                st.rerun()
+
         st.selectbox(
             "Theme 🎨",
             options=list(THEMES.keys()),
             key="theme",
             help="Select a pastel theme for the interface."
         )
+
+
+def render_onboarding_page() -> None:
+    """İlk giriş ekranı: Ekran süresi verilerini alma."""
+    st.title("Digital Well-Being 🌿")
+    st.write("Welcome! Let's start by looking at your screen time habits.")
+
+    st.markdown("---")
+    st.subheader("📊 Step 1: Upload Your Screen Time Data")
+
+    image_file = st.file_uploader(
+        "Upload a screen-time screenshot",
+        type=["png", "jpg", "jpeg", "webp"],
+        help="Optional. A screenshot from your phone's screen-time report.",
+        key="screen_time_upload",
+    )
+    notes = st.text_area(
+        "Anything you noticed about your usage?",
+        placeholder="e.g. I was on Instagram a lot after 10pm…",
+        key="usage_notes",
+    )
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        if st.button("📊 Analyze & Continue", type="primary", use_container_width=True):
+            with st.spinner("Analyzing your screen time..."):
+                analysis = analyze_screen_time(image_file, notes)
+                st.session_state.last_analysis = analysis
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "I looked at your screen time. "
+                            f"{analysis['insight']} "
+                            f"Try this: {analysis['suggestion']}"
+                        ),
+                    }
+                )
+                st.session_state.step = "dashboard"
+                st.toast("Veriler başarıyla alındı ve analiz edildi! 🎉")
+                st.rerun()
+
+    with col2:
+        if st.button("Skip for now ➡️", use_container_width=True):
+            st.session_state.step = "dashboard"
+            st.rerun()
 
 
 def render_analysis_card() -> None:
@@ -186,8 +209,8 @@ def render_chat() -> None:
         )
     else:
         reply = (
-            "Upload a screen-time screenshot or add a note, then tap "
-            "**Analyze screen time**. I can also suggest events once you set a city."
+            "You haven't uploaded screen time data yet. "
+            "Set your city and hobbies in the sidebar to get offline event ideas."
         )
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
@@ -195,18 +218,32 @@ def render_chat() -> None:
         st.markdown(reply)
 
 
+def render_disclaimer() -> None:
+    """Ortadaki alanın en altına estetik bir sorumluluk reddi metni ekler."""
+    st.markdown("---")
+    st.caption(
+        "⚠️ **Sorumluluk Reddi:** Bu uygulama yalnızca farkındalık ve dijital refah rehberliği "
+        "amacıyla sunulmaktadır. Üretilen tavsiyeler yapay zeka tarafından oluşturulmuştur ve "
+        "profesyonel tıbbi/psikolojik tavsiye niteliği taşımaz. Yüklenen veriler işlendikten sonra saklanmaz."
+    )
+
+
 def main() -> None:
     init_session_state()
     apply_custom_theme(st.session_state.theme)
-    
-    st.title("Digital well-being")
-    st.write(
-        "Upload a screen-time screenshot, chat about your habits, "
-        "and get offline event ideas."
-    )
+
     render_sidebar()
-    render_analysis_card()
-    render_chat()
+
+    # Sayfa Yönlendirme Mantığı (State-Based Routing)
+    if st.session_state.step == "onboarding":
+        render_onboarding_page()
+    else:
+        st.title("Digital Well-Being Dashboard")
+        st.success("Veriler alındı! Koçunuz sorularınızı yanıtlamaya hazır.")
+        render_analysis_card()
+        render_chat()
+
+    render_disclaimer()
 
 
 if __name__ == "__main__":
