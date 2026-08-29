@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import streamlit as st
-from ai_engine import analyze_screen_time, get_event_recommendations
+from ai_engine import analyze_screen_time, get_event_recommendations, invoke_graph
+from langchain_core.messages import AIMessage, HumanMessage
 
 st.set_page_config(
     page_title="Digital Well-Being",
@@ -72,12 +73,52 @@ def apply_custom_theme(theme_name: str) -> None:
     st.markdown(css, unsafe_allow_html=True)
 
 
+def _analysis_text(analysis: object) -> str:
+    if isinstance(analysis, dict):
+        insight_text = str(analysis.get("insight") or analysis)
+        suggestions = analysis.get("suggestions") or []
+        extra = ""
+        if suggestions:
+            extra = " Try this: " + "; ".join(str(item) for item in suggestions)
+        elif analysis.get("suggestion"):
+            extra = f" Try this: {analysis['suggestion']}"
+        return f"{insight_text}{extra}".strip()
+    return str(analysis or "").strip()
+
+
+def _assistant_already_stored(content: str) -> bool:
+    return any(
+        message.get("role") == "assistant" and message.get("content") == content
+        for message in st.session_state.messages
+    )
+
+
+def append_assistant_once(content: str) -> None:
+    """Store the bot reply once in chat history."""
+    text = (content or "").strip()
+    if not text or _assistant_already_stored(text):
+        return
+    st.session_state.messages.append({"role": "assistant", "content": text})
+
+
+def _graph_history() -> list:
+    history: list = []
+    for message in st.session_state.messages:
+        content = message.get("content") or ""
+        if message.get("role") == "user":
+            history.append(HumanMessage(content=content))
+        elif message.get("role") == "assistant":
+            history.append(AIMessage(content=content))
+    return history
+
+
 def init_session_state() -> None:
     defaults: dict[str, object] = {
         "step": "onboarding",  # 'onboarding' veya 'dashboard'
         "messages": [],
         "last_analysis": None,
         "last_events": None,
+        "has_analyzed": False,
         "city": "",
         "hobbies": "",
         "theme": "Pastel Sage 🌿",
@@ -105,13 +146,14 @@ def render_sidebar() -> None:
                 st.session_state.hobbies,
             )
             st.session_state.last_events = events
-            st.session_state.messages.append(
-                {"role": "assistant", "content": events}
-            )
+            append_assistant_once(events)
 
         if st.session_state.step == "dashboard":
             if st.button("🔄 Restart / Upload New Screenshot", use_container_width=True):
                 st.session_state.step = "onboarding"
+                st.session_state.messages = []
+                st.session_state.last_analysis = None
+                st.session_state.has_analyzed = False
                 st.rerun()
 
         st.selectbox(
@@ -148,32 +190,10 @@ def render_onboarding_page() -> None:
         if st.button("📊 Analyze & Continue", type="primary", use_container_width=True):
             with st.spinner("Analyzing your screen time..."):
                 analysis = analyze_screen_time(image_file, notes)
-                st.session_state.last_analysis = analysis
-
-                # Safely handle both dict and string responses from backend
-                if isinstance(analysis, dict):
-                    insight_text = analysis.get("insight", str(analysis))
-                    suggestions = analysis.get("suggestions", [])
-                else:
-                    insight_text = str(analysis)
-                    suggestions = []
-
-                suggestion_text = ""
-                if suggestions:
-                    suggestion_text = " Try this: " + "; ".join(str(item) for item in suggestions)
-                elif isinstance(analysis, dict) and analysis.get("suggestion"):
-                    suggestion_text = f" Try this: {analysis['suggestion']}"
-
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "I looked at your screen time.\n\n"
-                            f"{insight_text}"
-                            f"{suggestion_text}"
-                        ),
-                    }
-                )
+                insight_text = _analysis_text(analysis)
+                st.session_state.last_analysis = insight_text
+                st.session_state.has_analyzed = True
+                append_assistant_once(insight_text)
                 st.session_state.step = "dashboard"
                 st.toast("Veriler başarıyla alındı ve analiz edildi! 🎉")
                 st.rerun()
@@ -196,7 +216,15 @@ def render_analysis_card() -> None:
 def render_chat() -> None:
     st.subheader("Well-being coach")
 
+    snapshot = (st.session_state.last_analysis or "").strip()
     for message in st.session_state.messages:
+        # Snapshot card already shows the analysis; don't paint it twice in chat.
+        if (
+            message.get("role") == "assistant"
+            and snapshot
+            and (message.get("content") or "").strip() == snapshot
+        ):
+            continue
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
@@ -208,16 +236,18 @@ def render_chat() -> None:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    analysis = st.session_state.last_analysis
-    if analysis:
-        reply = analysis
-    else:
-        reply = (
-            "You haven't uploaded screen time data yet. "
-            "Set your city and hobbies in the sidebar to get offline event ideas."
+    history = _graph_history()[:-1]
+    with st.spinner("Thinking..."):
+        reply = invoke_graph(
+            HumanMessage(content=prompt),
+            history=history,
+            has_analyzed=bool(
+                st.session_state.has_analyzed or st.session_state.last_analysis
+            ),
+            city=st.session_state.city or "",
+            activity_preference=st.session_state.hobbies or "",
         )
-
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+    append_assistant_once(reply)
     with st.chat_message("assistant"):
         st.markdown(reply)
 

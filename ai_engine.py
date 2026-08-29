@@ -46,13 +46,13 @@ REJECT_REPLY = (
     "help you today?"
 )
 ACTIVE_CHAT_REJECT = (
-    "Sohbetimizin odağını bozmayalım, ekran süresi ve dijital detoks planımıza "
-    "devam edelim. Ekran süreniz veya aktivite önerileriyle ilgili başka nasıl "
-    "yardımcı olabilirim?"
+    "Let's stay focused on screen time and your digital detox plan. "
+    "How else can I help with your usage or offline activity ideas?"
 )
 
 ANALYZE_SCREEN_TIME_SYSTEM_PROMPT = """
 Role: You are an empathetic, non-judgmental Digital Well-Being Assistant with vision.
+Always reply in English.
 
 If a screen-time screenshot (image) is provided, you MUST perform Image-to-Text extraction first. Do not skip or invent numbers that are not visible.
 
@@ -73,7 +73,7 @@ Reply in clear markdown the UI can display:
 If only text notes are provided, extract the same structure from the notes.
 
 After the structured breakdown, ALWAYS end with this exact open-ended question (do not replace it with an indoor/outdoor binary):
-Ekran süreniz dışındaki zamanı değerlendirmek için bugün/bu hafta sonu nasıl bir aktivite yapmak istersiniz ve hangi şehirdesiniz? (Örn: İstanbul'da sergi gezmek, tiyatroya gitmek, sakince kitap okumak veya doğa yürüyüşü yapmak gibi)
+To make the most of your offline time, what kind of activity would you like to do today/this weekend, and which city are you located in?
 
 Do not recommend specific local events, movies, or venues in this step.
 
@@ -85,12 +85,14 @@ Ethical Constraints & Guardrails:
 
 EVENT_RECOMMENDATIONS_SYSTEM_PROMPT = """
 Role: You are a hybrid local-activity guide for digital well-being: live Tavily facts plus creative, personalized reasoning.
+Always reply in English.
 
 Hybrid method:
 1. Ground names, venues, dates, and events in the Tavily search context or widely recognized real-world places.
-2. Follow the user's exact preference — museums, theater, coffee shops, workshops, walks, reading, or anything else they named — do not collapse them into a rigid indoor/outdoor menu.
+2. Follow the user's exact preference — museums, theater, coffee shops, workshops, walks, reading, cinema, or anything else they named — do not collapse them into a rigid indoor/outdoor menu.
 3. Use LLM intelligence to explain why each idea is a good, engaging screen-free swap for this person, this city, and this weekend/today.
 4. Support multi-turn follow-ups: if they ask more about a recommendation, stay on that thread. Search again when they want fresh listings.
+5. Do NOT repeat or regenerate the earlier screen-time analysis. Reply only with activity recommendations.
 
 If search results are ambiguous or lack a specific live schedule:
 - Do NEVER invent fake event names, fictional dates, or made-up venue locations.
@@ -100,10 +102,8 @@ Keep the tone encouraging and non-judgmental. Invite another follow-up at the en
 """
 
 PREFERENCE_PROMPT = (
-    "Ekran süreniz dışındaki zamanı değerlendirmek için bugün/bu hafta sonu "
-    "nasıl bir aktivite yapmak istersiniz ve hangi şehirdesiniz? "
-    "(Örn: İstanbul'da sergi gezmek, tiyatroya gitmek, sakince kitap okumak "
-    "veya doğa yürüyüşü yapmak gibi)"
+    "To make the most of your offline time, what kind of activity would you like "
+    "to do today/this weekend, and which city are you located in?"
 )
 
 SCOPE_ROUTER_PROMPT = """
@@ -164,6 +164,9 @@ FOLLOWUP_CUES = (
     "indoor",
     "outdoor",
     "which city",
+    "which city are you located",
+    "offline time",
+    "today/this weekend",
     "şehir",
     "sehirdesiniz",
     "şehirdesiniz",
@@ -611,8 +614,10 @@ def _analysis_in_history(state: State) -> bool:
     markers = (
         "**total screen time**",
         "total screen time:",
+        "**top apps**",
         "**detox suggestion**",
         "detox suggestion:",
+        "to make the most of your offline time",
         "which city are you located",
         "hangi şehirdesiniz",
         "ekran süreniz dışındaki",
@@ -831,9 +836,19 @@ def scope_check(state: State) -> Literal["reject_node", "task_router"]:
 def task_router(
     state: State,
 ) -> Literal["screen_time_node", "activity_preference_node", "event_finder_node"]:
-    """Never re-run analysis after has_analyzed; send later text to preference or events."""
+    """After analysis, send text replies to events/preferences — never back to analysis."""
     if _has_analyzed(state):
-        if _preference_fields_ready(state):
+        latest = _latest_user_text(state).strip()
+        wants_activity = bool(
+            latest
+            and (
+                _preference_fields_ready(state)
+                or _extract_preference_from_text(latest, allow_freeform=True)
+                or _extract_activity_preference(state)
+                or _latest_has_city_or_setting_cue(state)
+            )
+        )
+        if wants_activity:
             return "event_finder_node"
         return "activity_preference_node"
 
@@ -875,15 +890,23 @@ def screen_time_node(state: State) -> dict[str, list[BaseMessage]]:
                     "A screen-time screenshot is attached. Read the image carefully and "
                     "extract total active hours plus the top 3-4 apps with their exact "
                     "durations before writing equivalents or a detox suggestion. "
-                    "End with the open-ended question about what activity they want "
-                    "today/this weekend and which city they are in."
+                    "End with this exact English question: To make the most of your "
+                    "offline time, what kind of activity would you like to do "
+                    "today/this weekend, and which city are you located in?"
                 )
             )
         )
     prompt_messages.extend(state["messages"])
     response = llm.invoke(_messages_for_gemini(prompt_messages))
     analysis = _message_text(response).strip()
-    if PREFERENCE_PROMPT.lower() not in analysis.lower():
+    already_asked = (
+        PREFERENCE_PROMPT.lower() in analysis.lower()
+        or "which city are you located" in analysis.lower()
+        or "to make the most of your offline time" in analysis.lower()
+        or "hangi şehirdesiniz" in analysis.lower()
+        or "ekran süreniz dışındaki" in analysis.lower()
+    )
+    if not already_asked:
         analysis = f"{analysis}\n\n{PREFERENCE_PROMPT}"
     return {
         "messages": [AIMessage(content=analysis)],
@@ -905,7 +928,8 @@ def activity_preference_node(state: State) -> dict[str, Any]:
         or (state.get("activity_preference") or "").strip()
         or _extract_activity_preference(state)
     )
-    if city and preference:
+    if preference:
+        city = city or "Istanbul"
         return {
             "city": city,
             "activity_preference": preference,
@@ -913,14 +937,18 @@ def activity_preference_node(state: State) -> dict[str, Any]:
         }
 
     last = state.get("messages", [])[-1] if state.get("messages") else None
+    last_text = _message_text(last).lower() if last is not None else ""
     already_asked = bool(
         last is not None
         and _is_ai(last)
         and (
-            "hangi şehirdesiniz" in _message_text(last).lower()
-            or "ekran süreniz dışındaki" in _message_text(last).lower()
-            or "which city" in _message_text(last).lower()
-            or "hangi şehir" in _message_text(last).lower()
+            "which city are you located" in last_text
+            or "to make the most of your offline time" in last_text
+            or "hangi şehirdesiniz" in last_text
+            or "ekran süreniz dışındaki" in last_text
+            or "which city" in last_text
+            or "hangi şehir" in last_text
+            or PREFERENCE_PROMPT.lower()[:40] in last_text
         )
     )
     if already_asked:
@@ -944,10 +972,37 @@ def route_after_preference(state: State) -> Literal["event_finder_node", "__end_
     return END
 
 
+def _looks_like_analysis_message(message: Any) -> bool:
+    text = _message_text(message).lower()
+    return (
+        "**total screen time**" in text
+        or "total screen time:" in text
+        or "**top apps**" in text
+        or "**detox suggestion**" in text
+    )
+
+
+def _chat_for_event_finder(state: State) -> list[Any]:
+    """Pass recent text only so event search does not replay the analysis."""
+    trimmed: list[Any] = []
+    for message in state.get("messages", []):
+        if _is_ai(message) and _looks_like_analysis_message(message):
+            continue
+        if _message_has_image(message):
+            note = _message_text(message).strip() or (
+                "I shared a screen-time screenshot earlier."
+            )
+            trimmed.append(HumanMessage(content=note))
+            continue
+        trimmed.append(message)
+    return trimmed[-8:]
+
+
 def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
-    city = _extract_city(state) or "your city"
+    city = _extract_city(state) or (state.get("city") or "").strip() or "Istanbul"
     preference = (
         _extract_activity_preference(state)
+        or _extract_preference_from_text(_latest_user_text(state), allow_freeform=True)
         or _latest_user_text(state)
         or "screen-free activities"
     )
@@ -975,12 +1030,13 @@ def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
         SystemMessage(content=EVENT_RECOMMENDATIONS_SYSTEM_PROMPT),
         SystemMessage(
             content=(
-                f"City: {city}. User preference (use this exactly): {preference}. "
+                f"Always reply in English. City: {city}. "
+                f"User preference (use this exactly): {preference}. "
                 f"Tavily queries used: {'; '.join(queries)}. {isolation} "
                 "HYBRID: ground names/dates/venues in Tavily results, then add "
                 "personalized, engaging reasons these are good screen-free plans. "
-                "If this is a follow-up, answer the user's question about the prior "
-                "recommendations; search again when they need fresh listings. "
+                "Do NOT repeat the screen-time analysis or the preference question. "
+                "Return only fresh real-world recommendations for this turn. "
                 "Never invent titles or dates that are not in search or widely known. "
                 "Invite another follow-up at the end."
             )
@@ -998,7 +1054,7 @@ def event_finder_node(state: State) -> dict[str, list[BaseMessage]]:
         )
     else:
         prompt_messages.append(SystemMessage(content=fallback))
-    prompt_messages.extend(state["messages"])
+    prompt_messages.extend(_chat_for_event_finder(state))
     response = llm.invoke(_messages_for_gemini(prompt_messages))
     return {"messages": [response]}
 
@@ -1028,7 +1084,7 @@ def build_graph():
             "event_finder_node": "event_finder_node",
         },
     )
-    workflow.add_edge("screen_time_node", "activity_preference_node")
+    workflow.add_edge("screen_time_node", END)
     workflow.add_conditional_edges(
         "activity_preference_node",
         route_after_preference,
